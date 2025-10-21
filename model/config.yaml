@@ -1,0 +1,53 @@
+data:
+  dataset: "data/svebar/svebar_10perc.tsv"
+  is_distributed: "False"
+train:
+  isolates_to_sample_per_batch: 50000 #248000
+  n_metadata: 6
+  minimum_size_of_predictors: 4
+  d_mean_values: {3: 3, 4: 4, 5: 5, 6: 5.5, 7: 6, 8: 6.5, 9: 7, 10: 8, 11: 8, 12: 9, 13: 9, 14: 9, 15: 9, 16: 10, 17: 10, 18: 10, 19: 10, 20: 10, 21: 11}
+  d_max_samples: {3: 1, 4: 2, 5: 2, 6: 3, 7: 3, 8: 3, 9: 3, 10: 4, 11: 4, 12: 4, 13: 4, 14: 5, 15: 5, 16: 5, 17: 5, 18: 5, 19: 5, 20: 5, 21: 6}
+  batch_size: 512
+  ab_weights: {
+    'ESCCOL': {'AMO': [0.3, 0.7], 'AMC': [0.4, 0.6], 'AMP': [0.6, 0.4], 'CLE': [0.7, 0.3], 'CIX': [0.2, 0.8], 'CTA': [0.2, 0.8], 'CXI': [0.2, 0.8], 'CTZ': [0.2, 0.8], 'CTI': [0.1, 0.9], 'CIP': [0.2, 0.8], 'GEN': [0.1, 0.9], 'ISX': [0.2, 0.8], 'PIT': [0.1, 0.9], 'TOB': [0.1, 0.9], 'TRI': [0.2, 0.8], 'TRS': [0.3, 0.7]},
+    'STAAUR': {'AZI': [0.3, 0.7], 'CTA': [0.3, 0.7], 'CXI': [0.1, 0.9], 'CIP': [0.1, 0.9], 'DOX': [0.3, 0.7], 'ERY': [0.1, 0.9], 'ISX': [0.1, 0.9], 'CLI': [0.1, 0.9], 'MER': [0.2, 0.8], 'NOR': [0.1, 0.9], 'BEN': [0.7, 0.3], 'PIT': [0.2, 0.8], 'TET': [0.2, 0.8]},
+    'KLEPNE': {'AMC': [0.2, 0.8], 'CLE': [0.6, 0.4], 'CIX': [0.3, 0.7], 'CTA': [0.2, 0.8], 'CXI': [0.2, 0.8], 'CTZ': [0.2, 0.8], 'CTI': [0.1, 0.9], 'CIP': [0.1, 0.9], 'GEN': [0.1, 0.9], 'ISX': [0.2, 0.8], 'MEC': [0.1, 0.9], 'PIT': [0.2, 0.8], 'TOB': [0.1, 0.9], 'TRI': [0.2, 0.8], 'TRS': [0.3, 0.7]},
+    'HAEINF': {'AMO': [0.4, 0.6], 'AMC': [0.4, 0.6], 'AMP': [0.4, 0.6], 'CCL': [0.3, 0.7], 'BEN': [0.4, 0.6], 'TRS': [0.3, 0.7]},
+    'ENTFAE': {'CIP': [0.1, 0.9], 'NOR': [0.1, 0.9], 'TRI': [0.4, 0.6]},
+    'PSEAER': {'AZT': [0.7, 0.3], 'CEF': [0.1, 0.9], 'CTZ': [0.2, 0.7], 'CTV': [0.3, 0.7], 'CTT': [0.2, 0.8], 'CIP': [0.3, 0.7], 'GEN': [0.1, 0.9], 'IMI': [0.3, 0.7], 'IMR': [0.3, 0.7], 'MER': [0.1, 0.9], 'PIT': [0.2, 0.8], 'TOB': [0.1, 0.9]},
+    'STAEPI': {'CDR': [0.7, 0.3], 'CTA': [0.8, 0.2], 'CXI': [0.6, 0.4], 'CIP': [0.8, 0.2], 'ERY': [0.6, 0.4], 'FUS': [0.4, 0.6], 'GEN': [0.5, 0.5], 'ISX': [0.7, 0.3], 'CLI': [0.5, 0.5], 'MER': [0.7, 0.3], 'MOX': [0.6, 0.4], 'NOR': [0.5, 0.5], 'PIT': [0.7, 0.3], 'TOB': [0.5, 0.5], 'TRS': [0.5, 0.5]},
+    'STRPNE': {'DOX': [0.1, 0.9], 'ERY': [0.1, 0.9], 'CLI': [0.1, 0.9], 'OXA': [0.2, 0.8], 'PHE': [0.2, 0.8], 'TET': [0.1, 0.9], 'TRS': [0.1, 0.9]},
+    'PROMIR': {'AMO': [0.2, 0.8], 'AMP': [0.3, 0.7], 'CXI': [0.1, 0.9], 'GEN': [0.1, 0.9], 'ISX': [0.1, 0.9], 'MEC': [0.1, 0.9], 'TRI': [0.4, 0.6], 'TRS': [0.3, 0.7]},
+    'KLEOXY': {'AMC': [0.1, 0.9], 'CLE': [0.1, 0.9], 'MEC': [0.1, 0.9], 'PIT': [0.1, 0.9], 'TOB': [0.01, 0.99]}
+  }
+  n_epochs: 200
+  learning_rate: 0.0000001
+  learning_rate_warm_up: 1000
+  obs_per_epoch: 51200 #512000
+test:
+  isolates_to_sample_per_batch: 8000 #40000
+  obs_per_epoch: 25600 #256000
+  batch_size: 512
+model:
+  encode_response:  {'AMC_S': 0, 'AMC_R': 1, 'AMO_S': 0, 'AMO_R': 1, 'AMP_S': 0, 'AMP_R': 1, 'AZI_S': 0, 'AZI_R': 1, 'AZT_S': 0, 'AZT_R': 1, 'BEN_S': 0, 'BEN_R': 1, 'CCL_S': 0, 'CCL_R': 1, 'CDR_S': 0, 'CDR_R': 1, 'CEF_S': 0, 'CEF_R': 1, 'CIP_S': 0, 'CIP_R': 1, 'CIX_S': 0, 'CIX_R': 1, 'CLE_S': 0, 'CLE_R': 1, 'CLI_S': 0, 'CLI_R': 1, 'CTA_S': 0, 'CTA_R': 1, 'CTI_S': 0, 'CTI_R': 1, 'CTT_S': 0, 'CTT_R': 1, 'CTV_S': 0, 'CTV_R': 1, 'CTZ_S': 0, 'CTZ_R': 1, 'CXI_S': 0, 'CXI_R': 1, 'DOX_S': 0, 'DOX_R': 1, 'ERY_S': 0, 'ERY_R': 1, 'FUS_S': 0, 'FUS_R': 1, 'GEN_S': 0, 'GEN_R': 1, 'IMI_S': 0, 'IMI_R': 1, 'IMR_S': 0, 'IMR_R': 1, 'ISX_S': 0, 'ISX_R': 1, 'MEC_S': 0, 'MEC_R': 1, 'MER_S': 0, 'MER_R': 1, 'MOX_S': 0, 'MOX_R': 1, 'NOR_S': 0, 'NOR_R': 1, 'OXA_S': 0, 'OXA_R': 1, 'PHE_S': 0, 'PHE_R': 1, 'PIT_S': 0, 'PIT_R': 1, 'TET_S': 0, 'TET_R': 1, 'TOB_S': 0, 'TOB_R': 1, 'TRI_S': 0, 'TRI_R': 1, 'TRS_S': 0, 'TRS_R': 1}
+  pos_response: {'AMC_R': 1, 'AMO_R': 1, 'AMP_R': 1, 'AZI_R': 1, 'AZT_R': 1,'BEN_R': 1, 'CCL_R': 1, 'CDR_R': 1, 'CEF_R': 1, 'CIP_R': 1, 'CIX_R': 1, 'CLE_R': 1, 'CLI_R': 1, 'CTA_R': 1, 'CTI_R': 1, 'CTT_R': 1, 'CTV_R': 1, 'CTZ_R': 1, 'CXI_R': 1, 'DOX_R': 1, 'ERY_R': 1, 'FUS_R': 1, 'GEN_R': 1, 'IMI_R': 1, 'IMR_R': 1, 'ISX_R': 1, 'MEC_R': 1, 'MER_R': 1, 'MOX_R': 1, 'NOR_R': 1, 'OXA_R': 1, 'PHE_R': 1, 'PIT_R': 1, 'TET_R': 1, 'TOB_R': 1, 'TRI_R': 1, 'TRS_R': 1}
+  hidden_size: 64
+  layer_norm_eps: 0.00001 
+  dropout_rate_pwff: 0.1 
+  dropout_rate_attn: 0.1 
+  n_heads: 1
+  self_attn_size: 128
+  ffn_dimension: 128 
+  encoder_stack_depth: 1
+  max_seq_len: 22
+  n_antibiotics: 37
+  n_outputs: 2
+vocab:
+  vocab: 'vocabulary_obj.pth'
+  types_ab: {'Penicillin': ['AMC','AMO','AMP','BEN','ISX','MEC','OXA','PHE','PIT'], 'Cephalosporin': ['CCL','CDR','CEF','CLE','CIX','CTA','CXI','CTI','CTT','CTV','CTZ'],'Fluoroquinolones': ['CIP','MOX','NOR'],'Aminoglycoside': ['GEN','TOB'],'Carbapenem': ['IMI','IMR','MER'],'Tetracycline': ['DOX','TET'],'Macrolide': ['AZI','ERY'], 'Sulfonamide': ['TRI','TRS'], 'Monobactam': ['AZT'], 'Fusidane': ['FUS'], 'Lincosamide': ['CLI']}
+  types_ab2: {'AMC': 'Penicillin', 'AMO': 'Penicillin', 'AMP': 'Penicillin', 'BEN': 'Penicillin', 'ISX': 'Penicillin', 'MEC': 'Penicillin', 'OXA': 'Penicillin', 'PHE': 'Penicillin','PIT': 'Penicillin', 'CCL': 'Cephalosporin','CDR': 'Cephalosporin','CEF': 'Cephalosporin','CLE': 'Cephalosporin','CIX': 'Cephalosporin','CTA': 'Cephalosporin','CXI': 'Cephalosporin','CTI': 'Cephalosporin','CTT': 'Cephalosporin','CTV': 'Cephalosporin','CTZ': 'Cephalosporin','CIP': 'Fluoroquinolones','MOX': 'Fluoroquinolones','NOR': 'Fluoroquinolones','GEN': 'Aminoglycoside','TOB': 'Aminoglycoside','IMI': 'Carbapenem','IMR': 'Carbapenem','MER': 'Carbapenem','DOX': 'Tetracycline','TET': 'Tetracycline','AZI': 'Macrolide','ERY': 'Macrolide','TRI': 'Sulfonamide','TRS': 'Sulfonamide','AZT': 'Monobactam', 'FUS': 'Fusidane', 'CLI': 'Lincosamide'}
+  pad_position: 0
+val:
+  observations_train: 10000 #1000000
+  observations_test: 10000 #100000
+  observations_val: 10000 #100000
