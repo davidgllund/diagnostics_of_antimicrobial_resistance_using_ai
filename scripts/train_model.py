@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.optim as optim
 
 import os
-import time
+import time 
 import datetime
 import argparse
 import yaml
@@ -14,7 +14,6 @@ import pandas as pd
 import random
 
 from sys import argv
-from tqdm import tqdm
 from aux import ABTextDataset, expand_samples
 from model import Encoder, ABPred
 
@@ -133,7 +132,7 @@ def load_previous_state(state, model_folder, n_epochs, rank=0):
         print('Found previous state. Resuming...')
         start_epoch = state['epoch'] + 1
         avg_batch_time = state['avg_batch_time']
-        total_time = state['total_time']
+        total_time = state.get('total_time', 0.0)
         processed_batches = state['processed_batches']
         min_val_loss = state['min_val_loss']
 
@@ -197,17 +196,13 @@ def forward_epoch(df, config, transformer_model, classification_model, criterion
 
     # Metadata for resampling logic
     n_metadata = config['train']['n_metadata']
-    min_predictors = config['train']['minimum_size_of_predictors']
-    mean_values = config['train']['d_mean_values']
-    max_samples = config['train']['d_max_samples']
-
     pos_response = model_cfg['pos_response']
     antibiotics = [k.split('_')[0] for k in pos_response.keys()]
     n_batches = int(obs_per_epoch / batch_size)
     isolates_per_batch = data_cfg['isolates_to_sample_per_batch']
 
     # Resample and expand data for this epoch        
-    x, y = expand_samples(df, isolates_per_batch, n_metadata, min_predictors, mean_values, max_samples, epoch_idx)
+    x, y = expand_samples(df, isolates_per_batch, n_metadata, epoch_idx)
     
     # Random subsampling
     idx = np.random.choice(range(len(x)), size=min(len(x), obs_per_epoch), replace=False)
@@ -228,6 +223,8 @@ def forward_epoch(df, config, transformer_model, classification_model, criterion
     all_species, all_targets, all_preds, all_losses = [], [], [], []
 
     for batch_idx, (ex, ex_pos, x_resp, x_pos, y_resp, y_pos, length_ab, n_y) in enumerate(dataloader):
+        start_time = time.time()
+
         # Move tensors to device
         ex, ex_pos = ex.to(device), ex_pos.to(device)
         x_resp, x_pos = x_resp.to(device), x_pos.to(device)
@@ -293,6 +290,30 @@ def forward_epoch(df, config, transformer_model, classification_model, criterion
         all_species.extend(batch_species)
         all_targets.extend(batch_targets)
         all_preds.extend(batch_preds)
+
+        if train:
+            batch_time = time.time() - start_time
+            total_time += batch_time
+            processed_batches += 1
+            avg_batch_time = total_time / processed_batches
+
+            if rank == 0:
+                eta = datetime.timedelta(seconds=int(avg_batch_time * (n_epochs * n_batches - processed_batches)))
+                print(
+                    f"(epoch {epoch_idx+1}/{n_epochs or '?'}, batch {batch_idx+1}/{n_batches}) "
+                    f"ETA: {eta}, loss: {perform[0,batch_idx]:.3f}, acc: {perform[1,batch_idx]:.3f}",
+                    end="\r", flush=True
+                )
+        else:
+            if rank == 0:
+                print(
+                    f"(epoch {epoch_idx+1}/{n_epochs or '?'}, batch {batch_idx+1}/{n_batches}) "
+                    f"loss: {perform[0,batch_idx]:.3f}, acc: {perform[1,batch_idx]:.3f}",
+                    end="\r", flush=True
+                )
+
+        if rank == 0:
+            print()
         
         if batch_idx + 1 == n_batches:
             break
@@ -382,7 +403,7 @@ def main():
     train_species_metrics = pd.DataFrame()
     val_species_metrics = pd.DataFrame()
 
-    for epoch in tqdm(range(n_epochs), desc="Training Epochs", ncols=100):
+    for epoch in range(start_epoch, n_epochs):
         # Train phase
         perform_train, total_time, processed_batches, train_sp_metrics = forward_epoch(
             df_train, config, transformer_model, classification_model, criterion, 
@@ -440,7 +461,7 @@ def main():
 
     # Final testing phase
     if rank == 0:
-        print(f"Starting final test evaluation on {len(df_test)} samples...")
+        print(f"Starting final test evaluation...")
     
     perform_test, test_sp_metrics = forward_epoch(
         df_test, config, transformer_model, classification_model, criterion,
