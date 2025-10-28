@@ -6,7 +6,7 @@ import numpy as np
 from collections import Counter
 import random
 
-def expand_samples(dataset, isolates_per_batch, n_metadata, minimum_size_of_predictors, d_mean_values, d_max_samples, seed):
+def expand_samples(dataset, isolates_per_batch, n_metadata, seed):
     # Set random seeds for reproducibility
     if seed is None:
         seed = random.randint(1, 10**18)
@@ -27,26 +27,13 @@ def expand_samples(dataset, isolates_per_batch, n_metadata, minimum_size_of_pred
         antibiotics = isolate[n_metadata:]
         n_antibiotics = len(antibiotics)
 
-        # Skip if the number of antibiotics doesn't exist in mean value mapping
-        if n_antibiotics not in d_mean_values:
-            continue
-
-        # Determine sampling probability for predictors
-        mean_val = d_mean_values[n_antibiotics]
-        max_samples = d_max_samples[n_antibiotics]
-        p = mean_val / n_antibiotics
-
-        # Generate candidate predictor sizes using binomial distribution
-        candidate_sizes = np.random.binomial(n_antibiotics, p, max_samples)
-        candidate_sizes = candidate_sizes[candidate_sizes >= minimum_size_of_predictors]
-
-        # Generate predictor-response pairs for each candidate size
-        for size in candidate_sizes:
-            # Randomly select 'size' antibiotics as predictors
+        # Generate predictor-response pairs for each available number of antibiotics
+        for i in range(n_antibiotics):
+            # Randomly select i antibiotics as predictors
             predictor_indices = np.sort(
-                np.random.choice(n_antibiotics, size=size, replace=False)
+                np.random.choice(n_antibiotics, size=i, replace=False)
             )
-            selected_antibiotics = [antibiotics[i] for i in predictor_indices]
+            selected_antibiotics = [antibiotics[j] for j in predictor_indices]
 
             # Construct the predictor sequence (with <cls> token at start)
             predictors = ['<cls>', *metadata, *selected_antibiotics]
@@ -60,7 +47,66 @@ def expand_samples(dataset, isolates_per_batch, n_metadata, minimum_size_of_pred
         
     return all_predictors, all_responses
 
+class ABTextDataset(Dataset):
+    """
+    Custom Dataset for predictor-response sequences for antibiotic prediction.
+    """
+    def __init__(self, X, Y, vocab, antibiotics, max_seq_len, pos_response):
+        self.vocab = vocab
+        self.df = pd.DataFrame({'x': X, 'y': Y})
+        self.ab = antibiotics
+        self.max_seq_len = max_seq_len
+        self.pos_response = pos_response
+        self.pos_response_list  = list(pos_response.keys())
+        self.species = [x[6] for x in X]
 
+    def __len__(self):
+        """Number of samples in the dataset."""
+        return len(self.df)
+    
+    def __getitem__(self, idx):
+        """
+        Returns a single sample with all relevant tensors:
+        - token indices
+        - position indices
+        - predictor/response masks
+        - sequence lengths
+        """
+        token_x = self.df.iloc[idx].x
+        token_y = self.df.iloc[idx].y
+
+        # Extract metadata (year, month, age)
+        year = torch.tensor([int(token_x[1])], dtype=torch.float32)
+        month = torch.tensor([int(token_x[2])], dtype=torch.float32)
+        age = torch.tensor([int(token_x[3])], dtype=torch.float32)
+
+        del token_x[1:4]  # Remove year, month, age from token_x
+    
+        # Predictor positions for antibiotics in x
+        p_x = [t.split('_')[0] for t in token_x if t.split('_')[0] in self.ab]
+        x_pos = torch.tensor([t in p_x for t in self.ab], dtype=bool)
+
+        # Response indicators for x
+        x_resp = torch.tensor([1 if t in token_x else 0 for t in self.pos_response_list], dtype=torch.int64)
+
+        # Predictor positions for antibiotics in y
+        p_y = [t.split('_')[0] for t in token_y if t.split('_')[0] in self.ab]
+        y_pos = torch.tensor([t in p_y for t in self.ab], dtype=bool)
+
+        # Response indicators for y
+        y_resp = torch.tensor([1 if t in token_y else 0 for t in self.pos_response_list], dtype=torch.int64)
+
+        # Pad the sequence to max_seq_len
+        token_x = token_x + ['<pad>'] * (self.max_seq_len - len(token_x))
+        
+        # Convert tokens to indices
+        token_x = torch.tensor(self.vocab[token_x], dtype=torch.int64)
+
+        # Add species metadata (string)
+        species = self.species[idx]
+
+        return token_x, year, month, age, species, x_resp, x_pos, y_resp, y_pos
+    
 class Vocab:
     """
     Maps tokens to integer indices and vice versa.
@@ -102,60 +148,3 @@ class Vocab:
         """Index of unknown token <unk>."""
         return self.token_to_idx['<unk>']
     
-class ABTextDataset(Dataset):
-    """
-    Custom Dataset for predictor-response sequences for antibiotic prediction.
-    """
-    def __init__(self, X, Y, vocab, antibiotics, max_seq_len, pos_response, fake_position):
-        self.vocab = vocab
-        self.df = pd.DataFrame({'x': X, 'y': Y})
-        self.ab = antibiotics
-        self.max_seq_len = max_seq_len
-        self.fake_position = fake_position
-        self.pos_response = pos_response
-        self.pos_response_list  = list(pos_response.keys())
-
-    def __len__(self):
-        """Number of samples in the dataset."""
-        return len(self.df)
-    
-    def __getitem__(self, idx):
-        """
-        Returns a single sample with all relevant tensors:
-        - token indices
-        - position indices
-        - predictor/response masks
-        - sequence lengths
-        """
-        token_x = self.df.x.loc[idx]
-        token_y = self.df.y.loc[idx]
-        
-        len_x = len(token_x)
-        len_y = len(token_y)
-
-        # Predictor positions for antibiotics in x
-        p_x = [t.split('_')[0] for t in token_x if t.split('_')[0] in self.ab]
-        x_pos = torch.tensor([t in p_x for t in self.ab], dtype=bool)
-        # Response indicators for x
-        x_resp = torch.tensor([1 if t in token_x else 0 for t in self.pos_response_list], dtype=torch.int64)
-
-        # Predictor positions for antibiotics in y
-        p_y = [t.split('_')[0] for t in token_y if t.split('_')[0] in self.ab]
-        y_pos = torch.tensor([t in p_y for t in self.ab], dtype=bool)
-        # Response indicators for y
-        y_resp = torch.tensor([1 if t in token_y else 0 for t in self.pos_response_list], dtype=torch.int64)
-
-        # Pad the sequence to max_seq_len
-        token_x = token_x + ['<pad>'] * (self.max_seq_len - len_x)
-        token_x_pad = [t == '<pad>' for t in token_x]
-
-        # Create positional encoding tensor
-        pad_pos = torch.arange(self.max_seq_len) + 1
-        pad_pos[torch.tensor(token_x_pad)] = self.fake_position
-
-        # Convert tokens to indices
-        token_x = torch.tensor(self.vocab[token_x], dtype=torch.int64)
-
-        return token_x, pad_pos, x_resp, x_pos, y_resp, y_pos, torch.tensor(len_x, dtype=torch.int64), torch.tensor(len_y, dtype=torch.int64)
-
-        
