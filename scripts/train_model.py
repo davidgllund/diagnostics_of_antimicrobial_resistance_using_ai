@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 import random
 
+from sklearn.metrics import f1_score
 from sys import argv
 from aux import ABTextDataset, expand_samples
 from model import Encoder, ABPred
@@ -28,7 +29,7 @@ def parse_args(argv):
 
     return arguments
 
-def create_transformer_model(config, pad_id, fake_position=None, rank=0):
+def create_transformer_model(config, pad_id, rank=0):
     if rank == 0:
         print('Creating transformer model...')
 
@@ -50,11 +51,10 @@ def create_transformer_model(config, pad_id, fake_position=None, rank=0):
     # Build the transformer encoder
     transformer_model = Encoder(encoder_stack_depth, hidden_size, n_heads, max_seq_len, self_attn_size,
                                 ffn_dimension, layer_norm_eps, dropout_rate_attn, dropout_rate_pwff,
-                                vocab_size, pad_id, fake_position)
+                                vocab_size, pad_id)
     
     # Report parameter count
     n_trainable_params = sum(p.numel() for p in transformer_model.parameters() if p.requires_grad)
-
     if rank == 0:
         print(f'Transformer model parameters: {n_trainable_params:,}')
 
@@ -72,8 +72,8 @@ def create_classification_model(config, rank=0):
     n_outputs = model_cfg['n_outputs']
     
     classification_model = ABPred(hidden_size, n_antibiotics, n_outputs, layer_norm_eps)
-    n_trainable_params = sum(p.numel() for p in classification_model.parameters() if p.requires_grad)
 
+    n_trainable_params = sum(p.numel() for p in classification_model.parameters() if p.requires_grad)
     if rank == 0:
         print(f'Classification model paramaters: {n_trainable_params:,}')
 
@@ -184,7 +184,7 @@ def start_optimizer_loss(config, transformer, classification_model, device, rank
     return criterion, optimizer, scheduler
 
 def forward_epoch(df, config, transformer_model, classification_model, criterion, optimizer, scheduler, epoch_idx, total_time,
-                  processed_batches, device, n_epochs, rank, vocab, fake_position=None, train=True):
+                  processed_batches, device, n_epochs, rank, vocab, train=True):
 
     model_cfg = config['model']
     data_cfg = config['train'] if train else config['test']
@@ -210,7 +210,7 @@ def forward_epoch(df, config, transformer_model, classification_model, criterion
     y = [y[j] for j in idx]
 
     # Build dataset and dataloader
-    dataset = ABTextDataset(x, y, vocab, antibiotics, max_seq_len, pos_response, fake_position)
+    dataset = ABTextDataset(x, y, vocab, antibiotics, max_seq_len, pos_response)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size, shuffle=train, num_workers=0)
 
     # loss + accuracy for each batch
@@ -220,30 +220,32 @@ def forward_epoch(df, config, transformer_model, classification_model, criterion
     classification_model.train() if train else classification_model.eval()
 
     # Containers for metrics
-    all_species, all_targets, all_preds, all_losses = [], [], [], []
+    all_species, all_targets, all_preds, all_losses, all_antibiotics, all_n_ast = [], [], [], [], [], []
 
-    for batch_idx, (ex, ex_pos, x_resp, x_pos, y_resp, y_pos, length_ab, n_y) in enumerate(dataloader):
+    for batch_idx, (token_ids, year, month, age, species_batch, x_resp, x_pos, y_resp, y_pos) in enumerate(dataloader):
         start_time = time.time()
 
         # Move tensors to device
-        ex, ex_pos = ex.to(device), ex_pos.to(device)
+        token_ids = token_ids.to(device)
+        year, month, age = year.to(device), month.to(device), age.to(device)
         x_resp, x_pos = x_resp.to(device), x_pos.to(device)
         y_resp, y_pos = y_resp.to(device), y_pos.to(device)
         targets = y_resp[y_pos].to(device)
         valid_lens = None
 
+        batch_species = np.concatenate([np.repeat(species_batch[i], int(y_pos[i].sum())) for i in range(len(y_pos))]).tolist()
+        batch_n_ast = np.concatenate([np.repeat(x_pos[i].sum().cpu().item(), int(y_pos[i].sum())) for i in range(len(y_pos))]).tolist()
+
         # Forward + backward pass
         with torch.set_grad_enabled(train):
-            transformer_pred = transformer_model(ex, ex_pos, valid_lens)
+            transformer_pred = transformer_model(token_ids, year, month, age, valid_lens)
             classification_pred = classification_model(transformer_pred[:,0:1,:], y_pos)
 
             ids = torch.nonzero(y_pos)[:, 1]
-            species_meta = [meta[5] for meta in x]
 
             # Compute weighted loss per antibiotic/species
             loss = None
             ab_weights = config['train']['ab_weights']
-            antibiotics = [k.split('_')[0] for k in config['model']['pos_response'].keys()]
 
             for r, crit in enumerate(criterion):
                 mask = (ids == r)
@@ -255,10 +257,10 @@ def forward_epoch(df, config, transformer_model, classification_model, criterion
                     sample_weights = []
                     masked_indices = torch.nonzero(mask, as_tuple=False).squeeze(1)
                     for idx_in_masked, idx_in_full in enumerate(masked_indices):
-                        sp = species_meta[idx_in_full]
-                        class_idx = int(targets[mask][idx_in_masked].item())
+                        sp = batch_species[idx_in_full] # batch-local index
                         species_weights = ab_weights.get(sp, {})
                         antibiotic_weights = species_weights.get(antibiotic, [1.0, 1.0])
+                        class_idx = int(targets[mask][idx_in_masked].item())
                         sample_weight = antibiotic_weights[class_idx] if class_idx < len(antibiotic_weights) else 1.0
                         sample_weights.append(sample_weight)
 
@@ -285,11 +287,13 @@ def forward_epoch(df, config, transformer_model, classification_model, criterion
 
         batch_preds = torch.argmax(classification_pred, dim=1).detach().cpu().numpy()
         batch_targets = targets.detach().cpu().numpy()
-        batch_species = [species_meta[idx.item()] for idx in torch.nonzero(y_pos)[:, 0]]
+        batch_antibiotics = [antibiotics[idx.item()] for idx in ids]
 
         all_species.extend(batch_species)
         all_targets.extend(batch_targets)
         all_preds.extend(batch_preds)
+        all_antibiotics.extend(batch_antibiotics)
+        all_n_ast.extend(batch_n_ast)
 
         if train:
             batch_time = time.time() - start_time
@@ -321,29 +325,34 @@ def forward_epoch(df, config, transformer_model, classification_model, criterion
     # Aggregate results per species
     results_df = pd.DataFrame({
         "species": all_species,
+        "antibiotic": all_antibiotics,
         "true": all_targets,
         "pred": all_preds,
-        "loss": all_losses
+        "loss": all_losses,
+        "n_ast_results": all_n_ast
     })
-    species_metrics = (
-        results_df.groupby("species", group_keys=False)
+
+    # Compute species–antibiotic metrics
+    species_abx_metrics = (
+        results_df.groupby(["species", "antibiotic"], group_keys=False)
         .apply(lambda g: pd.Series({
-            "species": g.name,
+            "species": g.name[0],
+            "antibiotic": g.name[1],
             "accuracy": np.mean(g["true"] == g["pred"]),
             "avg_loss": np.mean(g["loss"]),
             "epoch": epoch_idx
-        }), include_groups=False)
+        }))
         .reset_index(drop=True)
     )
 
     # Clean up memory
-    del ex, ex_pos, x_resp, x_pos, y_resp, y_pos, targets, transformer_pred, classification_pred, x, y, dataset, dataloader
+    del token_ids, x_resp, x_pos, y_resp, y_pos, targets, transformer_pred, classification_pred, x, y, dataset, dataloader
     torch.cuda.empty_cache()
 
     if train:
-        return (perform, total_time, processed_batches, species_metrics)
+        return (perform, total_time, processed_batches, species_abx_metrics, results_df)
     else:
-        return perform, species_metrics
+        return perform, species_abx_metrics, results_df
 
 def save_model(path, model):
     if isinstance(model,torch.nn.DataParallel):
@@ -353,6 +362,35 @@ def save_model(path, model):
         state_dict = model.state_dict()
     
     torch.save(state_dict, path)
+
+def compute_final_metrics(results_df):
+    records = []
+    for (sp, abx, n_ast), g in results_df.groupby(["species", "antibiotic", "n_ast_results"]):
+        y_true = g["true"].astype(int)
+        y_pred = g["pred"].astype(int)
+
+        TP = ((y_true == 1) & (y_pred == 1)).sum()
+        TN = ((y_true == 0) & (y_pred == 0)).sum()
+        FP = ((y_true == 0) & (y_pred == 1)).sum()
+        FN = ((y_true == 1) & (y_pred == 0)).sum()
+
+        ME = FP / (FP + TN) if (FP + TN) > 0 else np.nan
+        VME = FN / (FN + TP) if (FN + TP) > 0 else np.nan
+        f1 = f1_score(y_true, y_pred, zero_division=0)
+        acc = np.mean(y_true == y_pred)
+
+        records.append({
+            "species": sp,
+            "antibiotic": abx,
+            "n_ast_results": n_ast,
+            "major_error": ME,
+            "very_major_error": VME,
+            "f1_score": f1,
+            "accuracy": acc,
+            "n_samples": len(g)
+        })
+        
+    return pd.DataFrame(records)
 
 def main():
     arguments = parse_args(argv)
@@ -366,7 +404,6 @@ def main():
     vocab_size = len(vocab.idx_to_token)
     config['vocab']['vocab_size'] = vocab_size
     pad_id = vocab.token_to_idx['<pad>']
-    fake_position = config['vocab']['pad_position']
 
     # Load dataset and split
     df = pd.read_csv(config['data']['dataset'], sep='\t')
@@ -377,7 +414,7 @@ def main():
 
     rank = 0
     print("Initializing model...")
-    transformer_model = create_transformer_model(config, pad_id, fake_position, rank)
+    transformer_model = create_transformer_model(config, pad_id, rank)
     classification_model = create_classification_model(config, rank)
 
     # Load previous weights if available
@@ -400,22 +437,22 @@ def main():
     torch.manual_seed(2025)
     random.seed(2025)
 
-    train_species_metrics = pd.DataFrame()
-    val_species_metrics = pd.DataFrame()
+    training_loss = pd.DataFrame()
+    validation_loss = pd.DataFrame()
 
     for epoch in range(start_epoch, n_epochs):
         # Train phase
-        perform_train, total_time, processed_batches, train_sp_metrics = forward_epoch(
+        perform_train, total_time, processed_batches, train_metrics, train_results_df = forward_epoch(
             df_train, config, transformer_model, classification_model, criterion, 
             optimizer, scheduler, epoch, total_time, processed_batches, device, 
-            n_epochs, rank, vocab, fake_position, train=True
+            n_epochs, rank, vocab, train=True
         )
 
         # Validation phase
-        perform_val, val_sp_metrics = forward_epoch(
+        perform_val, val_metrics, val_results_df = forward_epoch(
             df_val, config, transformer_model, classification_model, criterion, 
             optimizer, scheduler, epoch, total_time, processed_batches, device, 
-            n_epochs, rank, vocab, fake_position, train=False
+            n_epochs, rank, vocab, train=False
         )
 
         # Compute averages
@@ -451,31 +488,29 @@ def main():
         torch.save(val_loss, os.path.join(arguments.folder, 'pretrain_val_loss.pt'))
         torch.save(val_acc, os.path.join(arguments.folder, 'pretrain_val_acc.pt'))
 
-        train_species_metrics = pd.concat([train_species_metrics, train_sp_metrics], ignore_index=True)
-        val_species_metrics = pd.concat([val_species_metrics, val_sp_metrics], ignore_index=True)
+        training_loss = pd.concat([training_loss, train_metrics])
+        validation_loss = pd.concat([validation_loss, val_metrics])
 
-    train_species_metrics.to_csv(os.path.join(arguments.folder, 'train_species_metrics.tsv'), sep='\t', index=False)
-    val_species_metrics.to_csv(os.path.join(arguments.folder, 'val_species_metrics.tsv'), sep='\t', index=False)
+    training_loss.to_csv(os.path.join(arguments.folder, 'train_metrics.tsv'), sep='\t', index=False)
+    validation_loss.to_csv(os.path.join(arguments.folder, 'val_metrics.tsv'), sep='\t', index=False)
 
     print("Training complete!")
 
     # Final testing phase
     if rank == 0:
-        print(f"Starting final test evaluation...")
+        print(f"Starting final evaluation...")
+
+    train_final_metrics = compute_final_metrics(train_results_df)
+    train_final_metrics.to_csv(os.path.join(arguments.folder, 'train_final_metrics.tsv'), sep='\t', index=False)
     
-    perform_test, test_sp_metrics = forward_epoch(
+    perform_test, test_sp_metrics, test_results_df = forward_epoch(
         df_test, config, transformer_model, classification_model, criterion,
         optimizer, scheduler, n_epochs, total_time, processed_batches, device,
-        n_epochs, rank, vocab, fake_position, train=False
+        n_epochs, rank, vocab, train=False
         )
     
-    avg_test_loss = torch.mean(perform_test[0, :])
-    avg_test_acc = torch.mean(perform_test[1, :])
-
-    print(f"\nTest Results: Loss={avg_test_loss:.4f}, Accuracy={avg_test_acc:.4f}")
-
-    test_sp_metrics.to_csv(os.path.join(arguments.folder, 'test_species_metrics.tsv'), sep='\t', index=False)
-    print("Test results saved to test_species_metrics.tsv")
+    test_final_metrics = compute_final_metrics(test_results_df)
+    test_final_metrics.to_csv(os.path.join(arguments.folder, 'test_final_metrics.tsv'), sep='\t', index=False)
 
 if __name__ == '__main__':
     main()
