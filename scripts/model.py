@@ -7,12 +7,17 @@ def masked_softmax(X, valid_lens=None):
     if valid_lens is None:
         return F.softmax(X, dim=-1)
     
+    # Identify sequences with zero valid length
     batch_pad = torch.where(torch.sum(valid_lens==0,1) > 0)[0]
     pos_pad = torch.sum(valid_lens==0,1)[torch.sum(valid_lens==0,1) > 0]
 
+    # Repeat batch indices to align with positions to mask
     batch_pad = torch.repeat_interleave(batch_pad, pos_pad, dim=0)
+
+    # Flatten positions where valid_len == 0
     pos_pad = torch.where(valid_lens==0, torch.arange(valid_lens.shape[1]), -1).reshape(-1)[torch.where(valid_lens==0, torch.arange(valid_lens.shape[1]), -1).reshape(-1) >= 0]
     
+     # Set invalid positions to a very large negative value to nullify their softmax
     X[batch_pad,:,pos_pad,:] = -1e8
 
     return F.softmax(X, dim=-1)
@@ -38,23 +43,27 @@ class MultiHeadAttention(nn.Module):
         self.dropout_out = nn.Dropout(dropout_rate_attn)
         self.layer_norm = nn.LayerNorm(self.d_model, eps = layer_norm_eps)
 
-    def forward(self, x, valid_lens = None):
+    def forward(self, x, valid_lens=None):
         residual = x
         batch_size, seq_len, _ = x.size()
 
+        # Project input into query, key, value and reshape for multiple heads
         Q = self.W_q(x).view(batch_size, seq_len, self.num_heads, self.d_k)
         K = self.W_k(x).view(batch_size, seq_len, self.num_heads, self.d_k)
         V = self.W_v(x).view(batch_size, seq_len, self.num_heads, self.d_k)
         Q, K, V = Q.transpose(1,2), K.transpose(1,2), V.transpose(1,2)
 
+        # Compute scaled dot-product attention
         scores = torch.matmul(Q / self.d_k ** 0.5, K.transpose(2, 3))
         attn_weights = masked_softmax(scores, valid_lens)
         attn_weights = self.dropout_attn(attn_weights)
 
+        # Compute attention output
         output = torch.matmul(attn_weights, V)
         output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
         output = self.W_o(output)
 
+        # Apply dropout and layer normalization with residual connection
         output = self.layer_norm(self.dropout_out(output) + residual)
         return output
 
@@ -88,37 +97,49 @@ class SingleLayerEncoder(nn.Module):
         return output
 
 class Embeddings(nn.Module):
-    def __init__(self, vocab_size, hidden_size, max_seq_len, dropout_rate, layer_norm_eps, pad_id, fake_position=None) -> None:
+    def __init__(self, vocab_size, hidden_size, dropout_rate, layer_norm_eps, pad_id):
         super().__init__()
 
         self.token_embeddings = nn.Embedding(vocab_size, hidden_size, padding_idx=pad_id)
-        self.position_embeddings = nn.Embedding(max_seq_len+1, hidden_size, padding_idx=fake_position)
         self.layer_norm = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
         self.dropout = nn.Dropout(dropout_rate)
 
-    def forward(self, token_ids, position_ids):
+    def forward(self, token_ids):
         token_embeddings = self.token_embeddings(token_ids)
-        position_embeddings = self.position_embeddings(position_ids)
-        embeddings = token_embeddings + position_embeddings
-        embeddings = self.layer_norm(self.dropout(embeddings))
+        embeddings = self.layer_norm(self.dropout(token_embeddings))
 
         return embeddings
 
 class Encoder(nn.Module):
-    def __init__(self, encoder_stack_depth, hidden_size, n_heads, max_seq_len, self_attn_size, ffn_dimension, layer_norm_eps, dropout_rate_attn, dropout_rate_pwff, vocab_size, pad_id, fake_position):
+    def __init__(self, encoder_stack_depth, hidden_size, n_heads, max_seq_len, self_attn_size, ffn_dimension, layer_norm_eps, dropout_rate_attn, dropout_rate_pwff, vocab_size, pad_id):
         super().__init__()
 
         self.pad_idx = pad_id
-        self.embedding_layer = Embeddings(vocab_size, hidden_size, max_seq_len, dropout_rate_attn, layer_norm_eps, pad_id, fake_position)
+        self.embedding_layer = Embeddings(vocab_size, hidden_size, dropout_rate_attn, layer_norm_eps, pad_id)
+        
+        # Linear projections for continuous metadata features
+        self.year_proj = nn.Linear(1, hidden_size)
+        self.month_proj = nn.Linear(1, hidden_size)
+        self.age_proj = nn.Linear(1, hidden_size)
+        
+        # Stack of encoder layers
         self.blks = nn.Sequential()
-
         for i in range(encoder_stack_depth):
             self.blks.add_module(f"i{i}", SingleLayerEncoder(hidden_size, n_heads, max_seq_len, self_attn_size, ffn_dimension, layer_norm_eps, dropout_rate_attn, dropout_rate_pwff))
 
-    def forward(self, x, position_ids, valid_lens=None):
-        x = self.embedding_layer(x, position_ids)
+    def forward(self, token_ids, year, month, age, valid_lens=None):
+        
+        x = self.embedding_layer(token_ids)
         for blk in self.blks:
             x = blk(x, valid_lens)
+
+        # Embed continuous features and concatenate with token embeddings
+        year_emb = self.year_proj(year)
+        month_emb = self.month_proj(month)
+        age_emb = self.age_proj(age)
+
+        cont_emb = torch.stack([year_emb, month_emb, age_emb], dim=1)
+        x = torch.cat([cont_emb, x], dim=1)
 
         return x
     
@@ -126,7 +147,9 @@ class MLMClassifier(nn.Module):
     def __init__(self, hidden_size, n_outputs, layer_norm_eps) -> None:
         super().__init__()
 
-        self.mlm = nn.Sequential(nn.Linear(hidden_size, hidden_size), nn.ReLU(), nn.LayerNorm(hidden_size, eps=layer_norm_eps), nn.Linear(hidden_size, n_outputs))
+        # Each antibiotic has its own MLM classifier head
+        self.mlm = nn.Sequential(nn.Linear(hidden_size, hidden_size), nn.ReLU(), 
+                                 nn.LayerNorm(hidden_size, eps=layer_norm_eps), nn.Linear(hidden_size, n_outputs))
 
     def forward(self, x):
         x = self.mlm(x)
@@ -134,7 +157,7 @@ class MLMClassifier(nn.Module):
         return x
     
 class ABPred(nn.Module):
-    def __init__(self, hidden_size, n_antibiotics=56, n_outputs=2, layer_norm_eps=0.00001, **kwargs):
+    def __init__(self, hidden_size, n_antibiotics=37, n_outputs=2, layer_norm_eps=0.00001, **kwargs):
         super(ABPred, self).__init__(**kwargs)
 
         self.nn_stack = nn.ModuleList([MLMClassifier(hidden_size, n_outputs, layer_norm_eps) for _ in range(n_antibiotics)])
@@ -143,11 +166,12 @@ class ABPred(nn.Module):
         j = 0
         for encoder_layer in self.nn_stack:
             if j == 0:
-                mlm_Y_hat = encoder_layer(X)
+                mlm_Y_hat = encoder_layer(X) # First classifier output
                 j = 1
             else:
-                mlm_Y_hat = torch.cat((mlm_Y_hat, encoder_layer(X)), 1)
+                mlm_Y_hat = torch.cat((mlm_Y_hat, encoder_layer(X)), 1) # Concatenate outputs for all antibiotics
             
+        # Select only the positions corresponding to the antibiotics to predict
         Y_hat = mlm_Y_hat[positions_y]
 
         return Y_hat
