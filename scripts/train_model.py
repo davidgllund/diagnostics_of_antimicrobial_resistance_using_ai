@@ -33,7 +33,6 @@ def create_transformer_model(config, pad_id, rank=0):
     if rank == 0:
         print('Creating transformer model...')
 
-    # Unpack model parameters
     model_cfg = config['model']
     vocab_cfg = config['vocab']
 
@@ -48,12 +47,10 @@ def create_transformer_model(config, pad_id, rank=0):
     encoder_stack_depth = model_cfg['encoder_stack_depth']
     vocab_size = vocab_cfg['vocab_size']
 
-    # Build the transformer encoder
     transformer_model = Encoder(encoder_stack_depth, hidden_size, n_heads, max_seq_len, self_attn_size,
                                 ffn_dimension, layer_norm_eps, dropout_rate_attn, dropout_rate_pwff,
                                 vocab_size, pad_id)
     
-    # Report parameter count
     n_trainable_params = sum(p.numel() for p in transformer_model.parameters() if p.requires_grad)
     if rank == 0:
         print(f'Transformer model parameters: {n_trainable_params:,}')
@@ -96,14 +93,12 @@ def load_previous_model(model_folder, transformer_model, classification_model, r
 
     state = None
 
-    # Load saved transformer + classifier weights
     if os.path.exists(transformer_path):
         log('Loading previous model weights...')
         transformer_model.load_state_dict(torch.load(transformer_path))
         if os.path.exists(classifier_path):
             classification_model.load_state_dict(torch.load(classifier_path))
     
-    # Load optimizer and epoch state
     if os.path.exists(state_path):
         log('Loading previous state...')
         with open(state_path, 'rb') as f:
@@ -121,13 +116,11 @@ def load_previous_state(state, model_folder, n_epochs, rank=0):
     avg_batch_time, total_time, processed_batches = 0, 0, 0
     min_val_loss = 1000 
 
-    # Allocate metric containers
     train_loss = torch.zeros((n_epochs, 1))
     train_acc = torch.zeros((n_epochs, 1))
     val_loss = torch.zeros((n_epochs, 1))
     val_acc = torch.zeros((n_epochs, 1))
 
-    # If checkpoint exists, resume
     if state is not None and rank == 0:
         print('Found previous state. Resuming...')
         start_epoch = state['epoch'] + 1
@@ -136,13 +129,11 @@ def load_previous_state(state, model_folder, n_epochs, rank=0):
         processed_batches = state['processed_batches']
         min_val_loss = state['min_val_loss']
 
-        # Restore metric tensors
         train_loss_prev  = torch.load(os.path.join(model_folder, "pretrain_train_loss.pt"))
         train_acc_prev = torch.load(os.path.join(model_folder, "pretrain_train_acc.pt"))
         val_loss_prev = torch.load(os.path.join(model_folder, "pretrain_val_loss.pt"))
         val_acc_prev  = torch.load(os.path.join(model_folder, "pretrain_val_acc.pt"))
 
-        # Copy historical data
         train_loss[:train_loss_prev.shape[0], :train_loss_prev.shape[1]] = train_loss_prev
         train_acc[:train_acc_prev.shape[0], :train_acc_prev.shape[1]] = train_acc_prev
         val_loss[:val_loss_prev.shape[0], :val_loss_prev.shape[1]] = val_loss_prev
@@ -164,7 +155,6 @@ def start_optimizer_loss(config, transformer, classification_model, device, rank
     model_cfg = config['model']
     train_cfg = config['train']
     
-    # Unpack hyperparameters
     batch_size = train_cfg['batch_size']
     learning_rate = train_cfg['learning_rate']
     learning_rate_warm_up = train_cfg['learning_rate_warm_up']
@@ -172,13 +162,10 @@ def start_optimizer_loss(config, transformer, classification_model, device, rank
     pos_response = model_cfg['pos_response']
     antibiotics = [key.split('_')[0] for key in pos_response.keys()]
 
-    # One CrossEntropyLoss per antibiotic
     criterion = [nn.CrossEntropyLoss(reduction='none') for _ in antibiotics]
     
-    # Optimizer combines encoder and classifier parameters
     optimizer = optim.Adam(params=list(transformer.parameters()) + list(classification_model.parameters()), lr=learning_rate)
 
-    # Learning rate warm-up scheduler
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda step: min(step / (learning_rate_warm_up / batch_size), 1.0))
     
     return criterion, optimizer, scheduler
@@ -189,43 +176,35 @@ def forward_epoch(df, config, transformer_model, classification_model, criterion
     model_cfg = config['model']
     data_cfg = config['train'] if train else config['test']
 
-    # Key dataset and training parameters
     max_seq_len = model_cfg['max_seq_len']
     batch_size = data_cfg['batch_size']
     obs_per_epoch = data_cfg['obs_per_epoch']
 
-    # Metadata for resampling logic
     n_metadata = config['train']['n_metadata']
     pos_response = model_cfg['pos_response']
     antibiotics = [k.split('_')[0] for k in pos_response.keys()]
     n_batches = int(obs_per_epoch / batch_size)
     isolates_per_batch = data_cfg['isolates_to_sample_per_batch']
-
-    # Resample and expand data for this epoch        
+     
     x, y = expand_samples(df, isolates_per_batch, n_metadata, epoch_idx)
     
-    # Random subsampling
     idx = np.random.choice(range(len(x)), size=min(len(x), obs_per_epoch), replace=False)
     x = [x[j] for j in idx]
     y = [y[j] for j in idx]
 
-    # Build dataset and dataloader
     dataset = ABTextDataset(x, y, vocab, antibiotics, max_seq_len, pos_response)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size, shuffle=train, num_workers=0)
 
-    # loss + accuracy for each batch
     perform = torch.zeros(2, len(dataloader)) - 1.0
 
     transformer_model.train() if train else transformer_model.eval()
     classification_model.train() if train else classification_model.eval()
 
-    # Containers for metrics
     all_species, all_targets, all_preds, all_losses, all_antibiotics, all_n_ast = [], [], [], [], [], []
 
     for batch_idx, (token_ids, year, month, age, species_batch, x_resp, x_pos, y_resp, y_pos) in enumerate(dataloader):
         start_time = time.time()
 
-        # Move tensors to device
         token_ids = token_ids.to(device)
         year, month, age = year.to(device), month.to(device), age.to(device)
         x_resp, x_pos = x_resp.to(device), x_pos.to(device)
@@ -236,14 +215,12 @@ def forward_epoch(df, config, transformer_model, classification_model, criterion
         batch_species = np.concatenate([np.repeat(species_batch[i], int(y_pos[i].sum())) for i in range(len(y_pos))]).tolist()
         batch_n_ast = np.concatenate([np.repeat(x_pos[i].sum().cpu().item(), int(y_pos[i].sum())) for i in range(len(y_pos))]).tolist()
 
-        # Forward + backward pass
         with torch.set_grad_enabled(train):
             transformer_pred = transformer_model(token_ids, year, month, age, valid_lens)
-            classification_pred = classification_model(transformer_pred[:,0:1,:], y_pos)
+            classification_pred = classification_model(transformer_pred[:,3:4,:], y_pos)
 
             ids = torch.nonzero(y_pos)[:, 1]
 
-            # Compute weighted loss per antibiotic/species
             loss = None
             ab_weights = config['train']['ab_weights']
 
@@ -253,7 +230,6 @@ def forward_epoch(df, config, transformer_model, classification_model, criterion
                     antibiotic = antibiotics[r]
                     base_losses = crit(classification_pred[mask], targets[mask])
 
-                    # Apply species- and class-specific weighting
                     sample_weights = []
                     masked_indices = torch.nonzero(mask, as_tuple=False).squeeze(1)
                     for idx_in_masked, idx_in_full in enumerate(masked_indices):
@@ -272,7 +248,6 @@ def forward_epoch(df, config, transformer_model, classification_model, criterion
                     sample_losses = weighted_losses.detach().cpu().numpy()
                     all_losses.extend(sample_losses)
 
-            # Backpropagation
             if train:
                 optimizer.zero_grad()
                 loss.backward()
@@ -280,7 +255,6 @@ def forward_epoch(df, config, transformer_model, classification_model, criterion
                 if scheduler:
                     scheduler.step()
 
-        # Record performance metrics
         perform[0, batch_idx] = loss.item() if loss is not None else 0.0
         acc = (torch.argmax(classification_pred, dim=1) == targets).float().mean().item()
         perform[1, batch_idx] = acc
@@ -322,7 +296,6 @@ def forward_epoch(df, config, transformer_model, classification_model, criterion
         if batch_idx + 1 == n_batches:
             break
 
-    # Aggregate results per species
     results_df = pd.DataFrame({
         "species": all_species,
         "antibiotic": all_antibiotics,
@@ -332,7 +305,6 @@ def forward_epoch(df, config, transformer_model, classification_model, criterion
         "n_ast_results": all_n_ast
     })
 
-    # Compute species–antibiotic metrics
     species_abx_metrics = (
         results_df.groupby(["species", "antibiotic"], group_keys=False)
         .apply(lambda g: pd.Series({
@@ -399,13 +371,11 @@ def main():
     with open(os.path.join(arguments.folder, arguments.config), 'r') as f:
         config = yaml.safe_load(f)
 
-    # Load vocabulary
     vocab = torch.load(config['vocab']['vocab'], weights_only=False)
     vocab_size = len(vocab.idx_to_token)
     config['vocab']['vocab_size'] = vocab_size
     pad_id = vocab.token_to_idx['<pad>']
 
-    # Load dataset and split
     df = pd.read_csv(config['data']['dataset'], sep='\t')
     df['sentence'] = [x.split(' ') for x in df['sentence']]
     df_train = df.loc[~df['fold'].isin(['val', 'test'])]
@@ -417,15 +387,12 @@ def main():
     transformer_model = create_transformer_model(config, pad_id, rank)
     classification_model = create_classification_model(config, rank)
 
-    # Load previous weights if available
     state = load_previous_model(arguments.folder, transformer_model, classification_model, rank, load_previous=True)
 
-    # Move models to GPU if available
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     transformer_model.to(device)
     classification_model.to(device)
 
-    # Initialize optimizer/scheduler/loss
     criterion, optimizer, scheduler = start_optimizer_loss(config, transformer_model, classification_model, device, rank)
 
     n_epochs = config['train']['n_epochs']
@@ -441,21 +408,18 @@ def main():
     validation_loss = pd.DataFrame()
 
     for epoch in range(start_epoch, n_epochs):
-        # Train phase
         perform_train, total_time, processed_batches, train_metrics, train_results_df = forward_epoch(
             df_train, config, transformer_model, classification_model, criterion, 
             optimizer, scheduler, epoch, total_time, processed_batches, device, 
             n_epochs, rank, vocab, train=True
         )
 
-        # Validation phase
         perform_val, val_metrics, val_results_df = forward_epoch(
             df_val, config, transformer_model, classification_model, criterion, 
             optimizer, scheduler, epoch, total_time, processed_batches, device, 
             n_epochs, rank, vocab, train=False
         )
 
-        # Compute averages
         avg_train_loss = torch.mean(perform_train[0, :])
         avg_train_acc = torch.mean(perform_train[1, :])
         avg_val_loss = torch.mean(perform_val[0, :])
@@ -466,7 +430,6 @@ def main():
         val_loss[epoch] = avg_val_loss
         val_acc[epoch] = avg_val_acc
 
-        # Save checkpoint if validation improves
         if avg_val_loss < min_val_loss:
             min_val_loss = avg_val_loss
             save_model(os.path.join(arguments.folder, 'pretrain_transformer.torch'), transformer_model)
@@ -496,7 +459,6 @@ def main():
 
     print("Training complete!")
 
-    # Final testing phase
     if rank == 0:
         print(f"Starting final evaluation...")
 
