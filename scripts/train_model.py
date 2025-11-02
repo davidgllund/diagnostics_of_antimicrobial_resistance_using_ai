@@ -15,7 +15,7 @@ import random
 
 from sklearn.metrics import f1_score
 from sys import argv
-from aux import ABTextDataset, expand_samples
+from aux import ABTextDataset, expand_samples, to_device
 from model import Encoder, ABPred
 
 def parse_args(argv):
@@ -171,7 +171,7 @@ def start_optimizer_loss(config, transformer, classification_model, device, rank
     return criterion, optimizer, scheduler
 
 def forward_epoch(df, config, transformer_model, classification_model, criterion, optimizer, scheduler, epoch_idx, total_time,
-                  processed_batches, device, n_epochs, rank, vocab, train=True):
+                  processed_batches, device, n_epochs, rank, vocab, train=True, log_every=10):
 
     model_cfg = config['model']
     data_cfg = config['train'] if train else config['test']
@@ -193,23 +193,25 @@ def forward_epoch(df, config, transformer_model, classification_model, criterion
     y = [y[j] for j in idx]
 
     dataset = ABTextDataset(x, y, vocab, antibiotics, max_seq_len, pos_response)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size, shuffle=train, num_workers=0)
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size, shuffle=train, num_workers=4, pin_memory=True)
 
     perform = torch.zeros(2, len(dataloader)) - 1.0
 
     transformer_model.train() if train else transformer_model.eval()
     classification_model.train() if train else classification_model.eval()
 
-    all_species, all_targets, all_preds, all_losses, all_antibiotics, all_n_ast = [], [], [], [], [], []
+    all_preds_tensors = []
+    all_targets_tensors = []
+    all_losses_tensors = []
+    all_species = []
+    all_antibiotics = []
+    all_n_ast = []
+    batch_times = []
 
-    for batch_idx, (token_ids, year, month, age, species_batch, x_resp, x_pos, y_resp, y_pos) in enumerate(dataloader):
+    for batch_idx, batch in enumerate(dataloader):
         start_time = time.time()
 
-        token_ids = token_ids.to(device)
-        year, month, age = year.to(device), month.to(device), age.to(device)
-        x_resp, x_pos = x_resp.to(device), x_pos.to(device)
-        y_resp, y_pos = y_resp.to(device), y_pos.to(device)
-        targets = y_resp[y_pos].to(device)
+        token_ids, year, month, age, species_batch, x_resp, x_pos, y_resp, y_pos = to_device(batch, device)
         valid_lens = None
 
         batch_species = np.concatenate([np.repeat(species_batch[i], int(y_pos[i].sum())) for i in range(len(y_pos))]).tolist()
@@ -220,34 +222,32 @@ def forward_epoch(df, config, transformer_model, classification_model, criterion
             classification_pred = classification_model(transformer_pred[:,3:4,:], y_pos)
 
             ids = torch.nonzero(y_pos)[:, 1]
+            targets = y_resp[y_pos].to(device)
 
             loss = None
             ab_weights = config['train']['ab_weights']
 
+            per_sample_losses = torch.zeros((targets.size(0),), dtype=torch.float32, device=device)
+
             for r, crit in enumerate(criterion):
                 mask = (ids == r)
                 if mask.sum() > 0:
-                    antibiotic = antibiotics[r]
                     base_losses = crit(classification_pred[mask], targets[mask])
-
-                    sample_weights = []
                     masked_indices = torch.nonzero(mask, as_tuple=False).squeeze(1)
-                    for idx_in_masked, idx_in_full in enumerate(masked_indices):
-                        sp = batch_species[idx_in_full] # batch-local index
+
+                    sample_weights_tensor = torch.empty((masked_indices.size(0),), dtype=torch.float32, device=device)
+                    for j, idx_in_flat in enumerate(masked_indices):
+                        sp = batch_species[int(idx_in_flat)]
                         species_weights = ab_weights.get(sp, {})
-                        antibiotic_weights = species_weights.get(antibiotic, [1.0, 1.0])
-                        class_idx = int(targets[mask][idx_in_masked].item())
-                        sample_weight = antibiotic_weights[class_idx] if class_idx < len(antibiotic_weights) else 1.0
-                        sample_weights.append(sample_weight)
-
-                    sample_weights = torch.tensor(sample_weights, dtype=torch.float32, device=device)
-                    weighted_loss = (base_losses * sample_weights).mean()
-                    loss = weighted_loss if loss is None else loss + weighted_loss
-
-                    weighted_losses = base_losses * sample_weights 
-                    sample_losses = weighted_losses.detach().cpu().numpy()
-                    all_losses.extend(sample_losses)
-
+                        antibiotic_weights = species_weights.get(antibiotics[r], [1.0, 1.0])
+                        class_idx = int(targets[mask][j].item())
+                        sample_weights_tensor[j] = antibiotic_weights[class_idx] if class_idx < len(antibiotic_weights) else 1.0
+                    
+                    weighted_losses_mask = base_losses * sample_weights_tensor
+                    per_sample_losses[mask] += weighted_losses_mask
+                    weighted_loss = weighted_losses_mask.mean()
+                    loss = weighted_loss if (loss is None) else loss + weighted_loss
+            
             if train:
                 optimizer.zero_grad()
                 loss.backward()
@@ -259,49 +259,52 @@ def forward_epoch(df, config, transformer_model, classification_model, criterion
         acc = (torch.argmax(classification_pred, dim=1) == targets).float().mean().item()
         perform[1, batch_idx] = acc
 
-        batch_preds = torch.argmax(classification_pred, dim=1).detach().cpu().numpy()
-        batch_targets = targets.detach().cpu().numpy()
-        batch_antibiotics = [antibiotics[idx.item()] for idx in ids]
+        batch_preds_tensor = torch.argmax(classification_pred, dim=1).detach()
+        batch_targets_tensor = targets.detach()
 
-        all_species.extend(batch_species)
-        all_targets.extend(batch_targets)
-        all_preds.extend(batch_preds)
+        all_preds_tensors.append(batch_preds_tensor)
+        all_targets_tensors.append(batch_targets_tensor)
+        all_losses_tensors.append(per_sample_losses.detach())
+
+        ids = torch.nonzero(y_pos, as_tuple=False)[:, 1]
+        ids_cpu = ids.cpu().numpy()
+        batch_antibiotics = [antibiotics[int(i)] for i in ids_cpu]
+        
         all_antibiotics.extend(batch_antibiotics)
+        all_species.extend(batch_species)
         all_n_ast.extend(batch_n_ast)
 
-        if train:
-            batch_time = time.time() - start_time
-            total_time += batch_time
-            processed_batches += 1
-            avg_batch_time = total_time / processed_batches
+        batch_time = time.time() - start_time
+        batch_times.append(batch_time)
+        total_time += batch_time
+        processed_batches += 1
 
-            if rank == 0:
-                eta = datetime.timedelta(seconds=int(avg_batch_time * (n_epochs * n_batches - processed_batches)))
-                print(
-                    f"(epoch {epoch_idx+1}/{n_epochs or '?'}, batch {batch_idx+1}/{n_batches}) "
-                    f"ETA: {eta}, loss: {perform[0,batch_idx]:.3f}, acc: {perform[1,batch_idx]:.3f}",
-                    end="\r", flush=True
-                )
-        else:
-            if rank == 0:
-                print(
-                    f"(epoch {epoch_idx+1}/{n_epochs or '?'}, batch {batch_idx+1}/{n_batches}) "
-                    f"loss: {perform[0,batch_idx]:.3f}, acc: {perform[1,batch_idx]:.3f}",
-                    end="\r", flush=True
-                )
-
-        if rank == 0:
+        if rank == 0 and ((batch_idx + 1) % log_every == 0 or batch_idx + 1 == n_batches):
+            avg_bt = sum(batch_times[-log_every:]) / len(batch_times[-log_every:]) if batch_times else 0.0
+            eta = datetime.timedelta(seconds=int(avg_bt * (n_epochs * n_batches - processed_batches)))
+            loss_display = loss.item() if loss is not None else float('nan')
+            print(f"(epoch {epoch_idx+1}/{n_epochs}, batch {batch_idx+1}/{n_batches}) ETA: {eta}, loss: {loss_display:.4f}", end="\r", flush=True)
             print()
-        
+
         if batch_idx + 1 == n_batches:
             break
 
+    if all_preds_tensors:
+        preds = torch.cat(all_preds_tensors, dim=0).cpu().numpy()
+        trues = torch.cat(all_targets_tensors, dim=0).cpu().numpy()
+        losses = torch.cat(all_losses_tensors, dim=0).cpu().numpy()
+    else:
+        preds = np.array([])
+        trues = np.array([])
+        losses = np.array([])
+
+    # Build results_df from flattened arrays (vectorized)
     results_df = pd.DataFrame({
         "species": all_species,
         "antibiotic": all_antibiotics,
-        "true": all_targets,
-        "pred": all_preds,
-        "loss": all_losses,
+        "true": trues,
+        "pred": preds,
+        "loss": losses,
         "n_ast_results": all_n_ast
     })
 
@@ -317,9 +320,7 @@ def forward_epoch(df, config, transformer_model, classification_model, criterion
         .reset_index(drop=True)
     )
 
-    # Clean up memory
     del token_ids, x_resp, x_pos, y_resp, y_pos, targets, transformer_pred, classification_pred, x, y, dataset, dataloader
-    torch.cuda.empty_cache()
 
     if train:
         return (perform, total_time, processed_batches, species_abx_metrics, results_df)

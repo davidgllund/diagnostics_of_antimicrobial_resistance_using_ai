@@ -40,6 +40,15 @@ def expand_samples(dataset, isolates_per_batch, n_metadata, seed):
         
     return all_predictors, all_responses
 
+def to_device(batch, device):
+    res = []
+    for item in batch:
+        if torch.is_tensor(item):
+            res.append(item.to(device, non_blocking=True))
+        else:
+            res.append(item)
+    return tuple(res)
+
 class ABTextDataset(Dataset):
     """
     Custom Dataset for predictor-response sequences for antibiotic prediction.

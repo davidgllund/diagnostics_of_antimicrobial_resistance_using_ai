@@ -107,7 +107,6 @@ class Encoder(nn.Module):
 
         self.pad_idx = pad_id
         self.embedding_layer = Embeddings(vocab_size, hidden_size, dropout_rate_attn, layer_norm_eps, pad_id)
-        s
         self.year_proj = nn.Linear(1, hidden_size)
         self.month_proj = nn.Linear(1, hidden_size)
         self.age_proj = nn.Linear(1, hidden_size)
@@ -148,13 +147,8 @@ class ABPred(nn.Module):
         self.nn_stack = nn.ModuleList([MLMClassifier(hidden_size, n_outputs, layer_norm_eps) for _ in range(n_antibiotics)])
 
     def forward(self, X, positions_y):
-        j = 0
-        for encoder_layer in self.nn_stack:
-            if j == 0:
-                mlm_Y_hat = encoder_layer(X)
-                j = 1
-            else:
-                mlm_Y_hat = torch.cat((mlm_Y_hat, encoder_layer(X)), 1)
+        outs = [layer(X) for layer in self.nn_stack]
+        mlm_Y_hat = torch.cat(outs, dim=1)
             
         Y_hat = mlm_Y_hat[positions_y]
 
