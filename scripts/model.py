@@ -128,7 +128,7 @@ class Encoder(nn.Module):
 
         return x
     
-class MLMClassifier(nn.Module):
+class AntibioticClassifier(nn.Module):
     def __init__(self, hidden_size, n_outputs, layer_norm_eps) -> None:
         super().__init__()
 
@@ -144,12 +144,12 @@ class ABPred(nn.Module):
     def __init__(self, hidden_size, n_antibiotics=37, n_outputs=2, layer_norm_eps=0.00001, **kwargs):
         super(ABPred, self).__init__(**kwargs)
 
-        self.nn_stack = nn.ModuleList([MLMClassifier(hidden_size, n_outputs, layer_norm_eps) for _ in range(n_antibiotics)])
+        self.nn_stack = nn.ModuleList([AntibioticClassifier(hidden_size, n_outputs, layer_norm_eps) for _ in range(n_antibiotics)])
 
     def forward(self, X, positions_y):
         outs = [layer(X) for layer in self.nn_stack]
-        mlm_Y_hat = torch.cat(outs, dim=1)
+        ab_Y_hat = torch.cat(outs, dim=1)
             
-        Y_hat = mlm_Y_hat[positions_y]
+        Y_hat = ab_Y_hat[positions_y]
 
         return Y_hat
