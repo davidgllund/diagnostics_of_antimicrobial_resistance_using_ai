@@ -2,7 +2,6 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-
 import os
 import time 
 import datetime
@@ -12,18 +11,17 @@ import pickle as pkl
 import numpy as np
 import pandas as pd
 import random
+import gc
 
 from sklearn.metrics import f1_score
 from sys import argv
-from aux import ABTextDataset, expand_samples, to_device
+from aux import ABTextDataset, expand_samples, to_device, append_df_to_tsv, update_ema, print_progress
 from model import Encoder, ABPred
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(description='Build a transformer model for prediction of AST results.')
-    parser.add_argument('--config', '-c', required=True,
-                        help='Configuration file to use for building model.')
-    parser.add_argument('--folder', '-f', required=True,
-                        help='Folder where config file is located. Output files will be generated here.')
+    parser.add_argument('--config', '-c', required=True, help='Configuration file to use for building model.')
+    parser.add_argument('--folder', '-f', required=True, help='Folder where config file is located. Output files will be generated here.')
 
     arguments = parser.parse_args()
 
@@ -36,20 +34,19 @@ def create_transformer_model(config, pad_id, rank=0):
     model_cfg = config['model']
     vocab_cfg = config['vocab']
 
-    hidden_size = model_cfg['hidden_size']
-    max_seq_len = model_cfg['max_seq_len']
-    layer_norm_eps = model_cfg['layer_norm_eps']
-    dropout_rate_attn = model_cfg['dropout_rate_attn']
-    dropout_rate_pwff = model_cfg['dropout_rate_pwff']
-    n_heads = model_cfg['n_heads']
-    self_attn_size = model_cfg['self_attn_size']
-    ffn_dimension = model_cfg['ffn_dimension']
-    encoder_stack_depth = model_cfg['encoder_stack_depth']
-    vocab_size = vocab_cfg['vocab_size']
-
-    transformer_model = Encoder(encoder_stack_depth, hidden_size, n_heads, max_seq_len, self_attn_size,
-                                ffn_dimension, layer_norm_eps, dropout_rate_attn, dropout_rate_pwff,
-                                vocab_size, pad_id)
+    transformer_model = Encoder(
+        model_cfg['encoder_stack_depth'],
+        model_cfg['hidden_size'],
+        model_cfg['n_heads'],
+        model_cfg['max_seq_len'],
+        model_cfg['self_attn_size'],
+        model_cfg['ffn_dimension'],
+        model_cfg['layer_norm_eps'],
+        model_cfg['dropout_rate_attn'],
+        model_cfg['dropout_rate_pwff'],
+        vocab_cfg['vocab_size'],
+        pad_id
+    )
     
     n_trainable_params = sum(p.numel() for p in transformer_model.parameters() if p.requires_grad)
     if rank == 0:
@@ -62,13 +59,12 @@ def create_classification_model(config, rank=0):
         print('Creating classification model...')
 
     model_cfg = config['model']
-
-    hidden_size = model_cfg['hidden_size']
-    layer_norm_eps = model_cfg['layer_norm_eps']
-    n_antibiotics = model_cfg['n_antibiotics']
-    n_outputs = model_cfg['n_outputs']
     
-    classification_model = ABPred(hidden_size, n_antibiotics, n_outputs, layer_norm_eps)
+    classification_model = ABPred(model_cfg['hidden_size'], 
+                                  model_cfg['n_antibiotics'], 
+                                  model_cfg['n_outputs'], 
+                                  model_cfg['layer_norm_eps']
+                                )
 
     n_trainable_params = sum(p.numel() for p in classification_model.parameters() if p.requires_grad)
     if rank == 0:
@@ -108,70 +104,77 @@ def load_previous_model(model_folder, transformer_model, classification_model, r
 
     return state
 
-def load_previous_state(state, model_folder, n_epochs, rank=0):
+def load_previous_state(model_folder, n_epochs, rank=0):
     if rank == 0:
         print('Checking for previous state...')
 
-    start_epoch = 0
-    avg_batch_time, total_time, processed_batches = 0, 0, 0
-    min_val_loss = 1000 
+    train_results_path = os.path.join(model_folder, "training_results.tsv")
+    val_results_path = os.path.join(model_folder, "validation_results.tsv")
 
     train_loss = torch.zeros((n_epochs, 1))
     train_acc = torch.zeros((n_epochs, 1))
     val_loss = torch.zeros((n_epochs, 1))
     val_acc = torch.zeros((n_epochs, 1))
 
-    if state is not None and rank == 0:
-        print('Found previous state. Resuming...')
-        start_epoch = state['epoch'] + 1
-        avg_batch_time = state['avg_batch_time']
-        total_time = state.get('total_time', 0.0)
-        processed_batches = state['processed_batches']
-        min_val_loss = state['min_val_loss']
+    start_epoch = 0
+    min_val_loss = 1000
+    avg_batch_time = 0
+    total_time = 0
+    processed_batches = 0
 
-        train_loss_prev  = torch.load(os.path.join(model_folder, "pretrain_train_loss.pt"))
-        train_acc_prev = torch.load(os.path.join(model_folder, "pretrain_train_acc.pt"))
-        val_loss_prev = torch.load(os.path.join(model_folder, "pretrain_val_loss.pt"))
-        val_acc_prev  = torch.load(os.path.join(model_folder, "pretrain_val_acc.pt"))
-
-        train_loss[:train_loss_prev.shape[0], :train_loss_prev.shape[1]] = train_loss_prev
-        train_acc[:train_acc_prev.shape[0], :train_acc_prev.shape[1]] = train_acc_prev
-        val_loss[:val_loss_prev.shape[0], :val_loss_prev.shape[1]] = val_loss_prev
-        val_acc[:val_acc_prev.shape[0], :val_acc_prev.shape[1]] = val_acc_prev
-
+    if not os.path.exists(train_results_path) or not os.path.exists(val_results_path):
         if rank == 0:
-            print(f'Resuming training from epoch {start_epoch} (min val loss: {min_val_loss:.4f})\n')
+            print("No previous logs found. Starting from scratch.")
+        return train_loss, train_acc, val_loss, val_acc, start_epoch, avg_batch_time, total_time, processed_batches, min_val_loss
+    
+    df_train_log = pd.read_csv(train_results_path, sep="\t")
+    df_val_log   = pd.read_csv(val_results_path, sep="\t")
 
-    else:
+    if df_train_log.empty or df_val_log.empty:
         if rank == 0:
-            print('No previous state found.')
+            print("Log files empty. Starting from scratch.")
+        return train_loss, train_acc, val_loss, val_acc, start_epoch, avg_batch_time, total_time, processed_batches, min_val_loss
+    
+    last_train_epoch = df_train_log["epoch"].max()
+    last_val_epoch   = df_val_log["epoch"].max()
+    last_epoch = min(last_train_epoch, last_val_epoch)
 
+    for e in range(last_epoch + 1):
+        g_train = df_train_log[df_train_log["epoch"] == e]
+        g_val   = df_val_log[df_val_log["epoch"] == e]
+
+        if not g_train.empty:
+            train_loss[e] = g_train["loss"].mean()
+            train_acc[e]  = (g_train["true"] == g_train["pred"]).mean()
+
+        if not g_val.empty:
+            val_loss[e] = g_val["loss"].mean()
+            val_acc[e]  = (g_val["true"] == g_val["pred"]).mean()
+
+    # Best validation loss so far
+    min_val_loss = float(val_loss[: last_epoch + 1].min())
+
+    if rank == 0:
+        print(f"Resuming training from epoch {last_epoch + 1} (min val loss: {min_val_loss:.4f})")
+
+    start_epoch = last_epoch + 1
     return train_loss, train_acc, val_loss, val_acc, start_epoch, avg_batch_time, total_time, processed_batches, min_val_loss
 
-def start_optimizer_loss(config, transformer, classification_model, device, rank=0):
+def start_optimizer_loss(config, transformer, classification_model, rank=0):
     if rank == 0:
         print('Initializing optimizer and loss functions...')
 
     model_cfg = config['model']
     train_cfg = config['train']
-    
-    batch_size = train_cfg['batch_size']
-    learning_rate = train_cfg['learning_rate']
-    learning_rate_warm_up = train_cfg['learning_rate_warm_up']
 
-    pos_response = model_cfg['pos_response']
-    antibiotics = [key.split('_')[0] for key in pos_response.keys()]
+    antibiotics = [key.split('_')[0] for key in model_cfg['pos_response'].keys()]
 
     criterion = [nn.CrossEntropyLoss(reduction='none') for _ in antibiotics]
+    optimizer = optim.Adam(params=list(transformer.parameters()) + list(classification_model.parameters()), lr=train_cfg['learning_rate'])
     
-    optimizer = optim.Adam(params=list(transformer.parameters()) + list(classification_model.parameters()), lr=learning_rate)
+    return criterion, optimizer
 
-    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda step: min(step / (learning_rate_warm_up / batch_size), 1.0))
-    
-    return criterion, optimizer, scheduler
-
-def forward_epoch(df, config, transformer_model, classification_model, criterion, optimizer, scheduler, epoch_idx, total_time,
-                  processed_batches, device, n_epochs, rank, vocab, train=True, log_every=10):
+def forward_epoch(df, config, transformer_model, classification_model, criterion, optimizer, epoch_idx, device, vocab, train=True):
 
     model_cfg = config['model']
     data_cfg = config['train'] if train else config['test']
@@ -179,153 +182,181 @@ def forward_epoch(df, config, transformer_model, classification_model, criterion
     max_seq_len = model_cfg['max_seq_len']
     batch_size = data_cfg['batch_size']
     obs_per_epoch = data_cfg['obs_per_epoch']
-
+    isolates_per_batch = data_cfg['isolates_to_sample_per_batch']
     n_metadata = config['train']['n_metadata']
     pos_response = model_cfg['pos_response']
     antibiotics = [k.split('_')[0] for k in pos_response.keys()]
-    n_batches = int(obs_per_epoch / batch_size)
-    isolates_per_batch = data_cfg['isolates_to_sample_per_batch']
+
+    num_workers = min(4, os.cpu_count() or 1)
+    pin_memory = torch.cuda.is_available()
+    persistent_workers = num_workers > 0
      
     x, y = expand_samples(df, isolates_per_batch, n_metadata, epoch_idx)
-    
     idx = np.random.choice(range(len(x)), size=min(len(x), obs_per_epoch), replace=False)
     x = [x[j] for j in idx]
     y = [y[j] for j in idx]
 
     dataset = ABTextDataset(x, y, vocab, antibiotics, max_seq_len, pos_response)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size, shuffle=train, num_workers=4, pin_memory=True)
-
-    perform = torch.zeros(2, len(dataloader)) - 1.0
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size, shuffle=train, num_workers=num_workers, 
+                                             pin_memory=pin_memory, persistent_workers=persistent_workers)
+    
+    n_batches = int(np.ceil(min(len(dataset), obs_per_epoch) / batch_size))
+    perform = torch.zeros(2, n_batches, dtype=torch.float32) - 1.0
 
     transformer_model.train() if train else transformer_model.eval()
     classification_model.train() if train else classification_model.eval()
 
-    all_preds_tensors = []
-    all_targets_tensors = []
-    all_losses_tensors = []
+    ab_weights_cfg = config['train'].get('ab_weights', {})
+    ab_weight_map = {}
+    for sp, wt_map in ab_weights_cfg.items():
+        for k, v in wt_map.items():
+            ab_weight_map[(sp, k)] = v
+
+    preds_list = []
+    softmax_list = []
+    trues_list = []
+    losses_list = []
     all_species = []
     all_antibiotics = []
     all_n_ast = []
+
     batch_times = []
 
     for batch_idx, batch in enumerate(dataloader):
         start_time = time.time()
-
         token_ids, year, month, age, species_batch, x_resp, x_pos, y_resp, y_pos = to_device(batch, device)
         valid_lens = None
 
+        ids = torch.nonzero(y_pos, as_tuple=False)[:, 1]
+        targets = y_resp[y_pos].to(device)
+
         batch_species = np.concatenate([np.repeat(species_batch[i], int(y_pos[i].sum())) for i in range(len(y_pos))]).tolist()
-        batch_n_ast = np.concatenate([np.repeat(x_pos[i].sum().cpu().item(), int(y_pos[i].sum())) for i in range(len(y_pos))]).tolist()
+        batch_n_ast = np.concatenate([np.repeat(int(x_pos[i].sum().cpu().item()), int(y_pos[i].sum())) for i in range(len(y_pos))]).tolist()
+
+        ids_cpu = ids.cpu().numpy()
+        batch_antibiotics = [antibiotics[int(i)] for i in ids_cpu]
 
         with torch.set_grad_enabled(train):
             transformer_pred = transformer_model(token_ids, year, month, age, valid_lens)
             classification_pred = classification_model(transformer_pred[:,3:4,:], y_pos)
 
-            ids = torch.nonzero(y_pos)[:, 1]
-            targets = y_resp[y_pos].to(device)
+            softmax_scores = torch.softmax(classification_pred, dim=1)
 
             loss = None
-            ab_weights = config['train']['ab_weights']
-
             per_sample_losses = torch.zeros((targets.size(0),), dtype=torch.float32, device=device)
-
+            
             for r, crit in enumerate(criterion):
                 mask = (ids == r)
-                if mask.sum() > 0:
-                    base_losses = crit(classification_pred[mask], targets[mask])
-                    masked_indices = torch.nonzero(mask, as_tuple=False).squeeze(1)
+                if mask.sum() == 0:
+                    continue
+                base_losses = crit(classification_pred[mask], targets[mask])
+                
+                masked_indices = torch.nonzero(mask, as_tuple=False).squeeze(1).cpu().numpy()
+                if masked_indices.size == 0:
+                    continue
 
-                    sample_weights_tensor = torch.empty((masked_indices.size(0),), dtype=torch.float32, device=device)
-                    for j, idx_in_flat in enumerate(masked_indices):
-                        sp = batch_species[int(idx_in_flat)]
-                        species_weights = ab_weights.get(sp, {})
-                        antibiotic_weights = species_weights.get(antibiotics[r], [1.0, 1.0])
-                        class_idx = int(targets[mask][j].item())
-                        sample_weights_tensor[j] = antibiotic_weights[class_idx] if class_idx < len(antibiotic_weights) else 1.0
-                    
-                    weighted_losses_mask = base_losses * sample_weights_tensor
-                    per_sample_losses[mask] += weighted_losses_mask
-                    weighted_loss = weighted_losses_mask.mean()
-                    loss = weighted_loss if (loss is None) else loss + weighted_loss
+                sample_weights  = np.empty((masked_indices.size,), dtype=np.float32)
+                for j, idx_in_flat in enumerate(masked_indices):
+                    sp = batch_species[int(idx_in_flat)]
+                    weights_list = ab_weight_map.get((sp, antibiotics[r]), [1.0, 1.0])
+                    class_idx = int(targets[mask][j].item())
+                    sample_weights[j] = np.sqrt(weights_list[class_idx]) if class_idx < len(weights_list) else 1.0
+                
+                sample_weights_tensor = torch.from_numpy(sample_weights).to(device)
+                weighted_losses_mask = base_losses * sample_weights_tensor
+                per_sample_losses[mask] += weighted_losses_mask
+                weighted_loss = weighted_losses_mask.mean()
+                loss = weighted_loss if (loss is None) else loss + weighted_loss
+
+            if train:
+                ab_classes = config['vocab']['ab_class']
+                lambda_reg = config['vocab']['lambda_class_reg']
+
+                if lambda_reg > 0:
+                    abx_to_class = [ab_classes.get(abx, "unknown") for abx in antibiotics]
+                    class_to_indices = {}
+                    for i, cls in enumerate(abx_to_class):
+                        class_to_indices.setdefault(cls, []).append(i)
+
+                    class_means = {}
+                    for cls, idxs in class_to_indices.items():
+                        if len(idxs) < 2:
+                            continue
+                        mask_cls = (ids.unsqueeze(1) == torch.tensor(idxs, device=device)).any(dim=1)
+                        class_logits = classification_pred[mask_cls]
+                        if class_logits.size(0) > 0:
+                            class_means[cls] = class_logits.mean(dim=0)
+
+                    reg_loss = torch.tensor(0.0, device=device)
+                    for cls, idxs in class_to_indices.items():
+                        if cls not in class_means:
+                            continue
+                        for i in idxs:
+                            abx_mask = (ids == i)
+                            if abx_mask.sum() == 0:
+                                continue
+                            abx_logits = classification_pred[abx_mask]
+                            reg_loss += ((abx_logits - class_means[cls]) ** 2).mean()
+
+                    reg_loss = lambda_reg * reg_loss
+                    loss = loss + reg_loss
             
             if train:
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                if scheduler:
-                    scheduler.step()
 
-        perform[0, batch_idx] = loss.item() if loss is not None else 0.0
+        loss_val = loss.item() if loss is not None else float('nan')
         acc = (torch.argmax(classification_pred, dim=1) == targets).float().mean().item()
+        perform[0, batch_idx] = loss_val
         perform[1, batch_idx] = acc
 
-        batch_preds_tensor = torch.argmax(classification_pred, dim=1).detach()
-        batch_targets_tensor = targets.detach()
+        batch_preds_np = torch.argmax(classification_pred, dim=1).detach().cpu().numpy()
+        batch_softmax_np = softmax_scores.detach().cpu().numpy()
+        batch_targets_np = targets.detach().cpu().numpy()
+        batch_losses_np = per_sample_losses.detach().cpu().numpy()
 
-        all_preds_tensors.append(batch_preds_tensor)
-        all_targets_tensors.append(batch_targets_tensor)
-        all_losses_tensors.append(per_sample_losses.detach())
-
-        ids = torch.nonzero(y_pos, as_tuple=False)[:, 1]
-        ids_cpu = ids.cpu().numpy()
-        batch_antibiotics = [antibiotics[int(i)] for i in ids_cpu]
-        
+        preds_list.append(batch_preds_np)
+        softmax_list.append(batch_softmax_np)
+        trues_list.append(batch_targets_np)
+        losses_list.append(batch_losses_np)
         all_antibiotics.extend(batch_antibiotics)
         all_species.extend(batch_species)
         all_n_ast.extend(batch_n_ast)
 
         batch_time = time.time() - start_time
         batch_times.append(batch_time)
-        total_time += batch_time
-        processed_batches += 1
-
-        if rank == 0 and ((batch_idx + 1) % log_every == 0 or batch_idx + 1 == n_batches):
-            avg_bt = sum(batch_times[-log_every:]) / len(batch_times[-log_every:]) if batch_times else 0.0
-            eta = datetime.timedelta(seconds=int(avg_bt * (n_epochs * n_batches - processed_batches)))
-            loss_display = loss.item() if loss is not None else float('nan')
-            print(f"(epoch {epoch_idx+1}/{n_epochs}, batch {batch_idx+1}/{n_batches}) ETA: {eta}, loss: {loss_display:.4f}", end="\r", flush=True)
-            print()
 
         if batch_idx + 1 == n_batches:
             break
 
-    if all_preds_tensors:
-        preds = torch.cat(all_preds_tensors, dim=0).cpu().numpy()
-        trues = torch.cat(all_targets_tensors, dim=0).cpu().numpy()
-        losses = torch.cat(all_losses_tensors, dim=0).cpu().numpy()
+    if preds_list:
+        preds = np.concatenate(preds_list, axis=0)
+        softmaxes = np.concatenate(softmax_list, axis=0)
+        trues = np.concatenate(trues_list, axis=0)
+        losses = np.concatenate(losses_list, axis=0)
     else:
-        preds = np.array([])
-        trues = np.array([])
+        preds = np.array([], dtype=int)
+        softmaxes = np.array([]).reshape(0, 2)
+        trues = np.array([], dtype=int)
         losses = np.array([])
 
-    # Build results_df from flattened arrays (vectorized)
     results_df = pd.DataFrame({
         "species": all_species,
         "antibiotic": all_antibiotics,
         "true": trues,
         "pred": preds,
         "loss": losses,
-        "n_ast_results": all_n_ast
+        "n_ast_results": all_n_ast,
+        "softmax_score": softmaxes[:, 1],
+        "epoch": epoch_idx
     })
 
-    species_abx_metrics = (
-        results_df.groupby(["species", "antibiotic"], group_keys=False)
-        .apply(lambda g: pd.Series({
-            "species": g.name[0],
-            "antibiotic": g.name[1],
-            "accuracy": np.mean(g["true"] == g["pred"]),
-            "avg_loss": np.mean(g["loss"]),
-            "epoch": epoch_idx
-        }))
-        .reset_index(drop=True)
-    )
-
     del token_ids, x_resp, x_pos, y_resp, y_pos, targets, transformer_pred, classification_pred, x, y, dataset, dataloader
+    torch.cuda.empty_cache()
+    gc.collect()
 
-    if train:
-        return (perform, total_time, processed_batches, species_abx_metrics, results_df)
-    else:
-        return perform, species_abx_metrics, results_df
+    return (perform, sum(batch_times), len(batch_times), results_df)
 
 def save_model(path, model):
     if isinstance(model,torch.nn.DataParallel):
@@ -394,32 +425,76 @@ def main():
     transformer_model.to(device)
     classification_model.to(device)
 
-    criterion, optimizer, scheduler = start_optimizer_loss(config, transformer_model, classification_model, device, rank)
+    criterion, optimizer = start_optimizer_loss(config, transformer_model, classification_model, rank)
 
     n_epochs = config['train']['n_epochs']
     train_loss, train_acc, val_loss, val_acc, start_epoch, avg_batch_time, total_time, processed_batches, min_val_loss = load_previous_state(
-        state, arguments.folder, n_epochs, rank
+        arguments.folder, n_epochs, rank
     )
 
     np.random.seed(2025)
     torch.manual_seed(2025)
     random.seed(2025)
 
-    training_loss = pd.DataFrame()
-    validation_loss = pd.DataFrame()
+    train_results_path = os.path.join(arguments.folder, "training_results.tsv")
+    val_results_path = os.path.join(arguments.folder, "validation_results.tsv")
+
+    # For progress reporting
+    ema_batch_time = None
+    obs_train = config['train']['obs_per_epoch']
+    obs_val   = config['test']['obs_per_epoch']
+    bs_train  = config['train']['batch_size']
+    bs_val    = config['test']['batch_size']
+
+    train_batches_per_epoch = int(np.ceil(obs_train / bs_train))
+    val_batches_per_epoch   = int(np.ceil(obs_val   / bs_val))
+
+    batches_per_epoch = train_batches_per_epoch + val_batches_per_epoch
+    total_training_batches = n_epochs * batches_per_epoch
+    processed_batches_global = start_epoch * batches_per_epoch
 
     for epoch in range(start_epoch, n_epochs):
-        perform_train, total_time, processed_batches, train_metrics, train_results_df = forward_epoch(
+        step_in_epoch = 0
+        epoch_start = time.time()
+
+        perform_train, train_time, train_batch_count, train_results_df = forward_epoch(
             df_train, config, transformer_model, classification_model, criterion, 
-            optimizer, scheduler, epoch, total_time, processed_batches, device, 
-            n_epochs, rank, vocab, train=True
+            optimizer, epoch, device, vocab, train=True
         )
 
-        perform_val, val_metrics, val_results_df = forward_epoch(
+        per_batch_time = train_time / train_batch_count
+        for _ in range(train_batch_count):
+            ema_batch_time = update_ema(ema_batch_time, per_batch_time)
+            step_in_epoch += 1
+            processed_batches_global += 1
+            print_progress(epoch, step_in_epoch, batches_per_epoch,
+                        processed_batches_global, total_training_batches,
+                        ema_batch_time, epoch_start)
+
+        append_df_to_tsv(train_results_path, train_results_df)
+        del train_results_df
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        perform_val, val_time, val_batch_count, val_results_df = forward_epoch(
             df_val, config, transformer_model, classification_model, criterion, 
-            optimizer, scheduler, epoch, total_time, processed_batches, device, 
-            n_epochs, rank, vocab, train=False
+            optimizer, epoch, device, vocab, train=False
         )
+
+        for _ in range(val_batch_count):
+            ema_batch_time = update_ema(ema_batch_time, per_batch_time)
+            step_in_epoch += 1
+            processed_batches_global += 1
+            print_progress(epoch, step_in_epoch, batches_per_epoch,
+                        processed_batches_global, total_training_batches,
+                        ema_batch_time, epoch_start)
+
+        append_df_to_tsv(val_results_path, val_results_df)
+        del val_results_df
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        print()
 
         avg_train_loss = torch.mean(perform_train[0, :])
         avg_train_acc = torch.mean(perform_train[1, :])
@@ -447,33 +522,23 @@ def main():
         with open(os.path.join(arguments.folder, 'pretrain_state.pkl'), 'wb') as f:
             pkl.dump(state, f)
 
-        torch.save(train_loss, os.path.join(arguments.folder, 'pretrain_train_loss.pt'))
-        torch.save(train_acc, os.path.join(arguments.folder, 'pretrain_train_acc.pt'))
-        torch.save(val_loss, os.path.join(arguments.folder, 'pretrain_val_loss.pt'))
-        torch.save(val_acc, os.path.join(arguments.folder, 'pretrain_val_acc.pt'))
-
-        training_loss = pd.concat([training_loss, train_metrics])
-        validation_loss = pd.concat([validation_loss, val_metrics])
-
-    training_loss.to_csv(os.path.join(arguments.folder, 'train_metrics.tsv'), sep='\t', index=False)
-    validation_loss.to_csv(os.path.join(arguments.folder, 'val_metrics.tsv'), sep='\t', index=False)
-
     print("Training complete!")
 
     if rank == 0:
         print(f"Starting final evaluation...")
 
-    train_final_metrics = compute_final_metrics(train_results_df)
-    train_final_metrics.to_csv(os.path.join(arguments.folder, 'train_final_metrics.tsv'), sep='\t', index=False)
+    train_results_combined = pd.read_csv(train_results_path, sep='\t')
+    train_final_metrics = compute_final_metrics(train_results_combined)
+    train_final_metrics.to_csv(os.path.join(arguments.folder, 'train_metrics.tsv'), sep='\t', index=False)
     
-    perform_test, test_sp_metrics, test_results_df = forward_epoch(
-        df_test, config, transformer_model, classification_model, criterion,
-        optimizer, scheduler, n_epochs, total_time, processed_batches, device,
-        n_epochs, rank, vocab, train=False
+    perform_test, test_time, test_time, test_results_df = forward_epoch(
+        df_test, config, transformer_model, classification_model, criterion, 
+            optimizer, n_epochs, device, vocab, train=False
         )
     
+    test_results_df.to_csv(os.path.join(arguments.folder, 'test_results.tsv'), sep='\t', index=False)
     test_final_metrics = compute_final_metrics(test_results_df)
-    test_final_metrics.to_csv(os.path.join(arguments.folder, 'test_final_metrics.tsv'), sep='\t', index=False)
+    test_final_metrics.to_csv(os.path.join(arguments.folder, 'test_metrics.tsv'), sep='\t', index=False)
 
 if __name__ == '__main__':
     main()
