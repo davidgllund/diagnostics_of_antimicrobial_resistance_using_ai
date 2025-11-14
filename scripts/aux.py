@@ -5,6 +5,8 @@ import pandas as pd
 import numpy as np
 from collections import Counter
 import random
+import os
+import time
 
 def expand_samples(dataset, isolates_per_batch, n_metadata, seed):
     if seed is None:
@@ -48,6 +50,35 @@ def to_device(batch, device):
         else:
             res.append(item)
     return tuple(res)
+
+def append_df_to_tsv(path, df, sep='\t'):
+    """Append df to path. Writes header if file does not exist."""
+    write_header = not os.path.exists(path)
+    # Use mode 'a' (append) for speed and low memory
+    df.to_csv(path, mode='a', sep=sep, header=write_header, index=False)
+
+def update_ema(ema, value, alpha=0.05):
+    if ema is None:
+        return value
+    return (1 - alpha) * ema + alpha * value
+
+def print_progress(epoch, step_in_epoch, batches_per_epoch,
+                   processed_batches_global, total_training_batches,
+                   ema_bt, epoch_start):
+    
+    global_pct = 100 * processed_batches_global / total_training_batches
+    epoch_pct  = 100 * step_in_epoch / batches_per_epoch
+
+    remaining_batches = total_training_batches - processed_batches_global
+    remaining_time = remaining_batches * ema_bt
+    eta_min = remaining_time / 60
+
+    print(
+        f"\rEpoch {epoch+1} [{epoch_pct:5.1f}%] | "
+        f"Training {global_pct:5.1f}% | "
+        f"ETA (full run): {eta_min:6.2f} min",
+        end=""
+    )
 
 class ABTextDataset(Dataset):
     """
