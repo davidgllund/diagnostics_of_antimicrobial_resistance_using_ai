@@ -356,7 +356,10 @@ def forward_epoch(df, config, transformer_model, classification_model, criterion
     torch.cuda.empty_cache()
     gc.collect()
 
-    return (perform, sum(batch_times), len(batch_times), results_df)
+    class_metrics_df = compute_final_metrics(results_df)
+    class_metrics_df["epoch"] = epoch_idx
+
+    return (perform, sum(batch_times), len(batch_times), class_metrics_df)
 
 def save_model(path, model):
     if isinstance(model,torch.nn.DataParallel):
@@ -372,6 +375,7 @@ def compute_final_metrics(results_df):
     for (sp, abx, n_ast), g in results_df.groupby(["species", "antibiotic", "n_ast_results"]):
         y_true = g["true"].astype(int)
         y_pred = g["pred"].astype(int)
+        losses = g["loss"].astype(float)
 
         TP = ((y_true == 1) & (y_pred == 1)).sum()
         TN = ((y_true == 0) & (y_pred == 0)).sum()
@@ -391,7 +395,10 @@ def compute_final_metrics(results_df):
             "very_major_error": VME,
             "f1_score": f1,
             "accuracy": acc,
-            "n_samples": len(g)
+            "n_samples": len(g),
+            "loss_mean": losses.mean(),
+            "loss_median": losses.median(),
+            "loss_std": losses.std(),
         })
         
     return pd.DataFrame(records)
@@ -526,10 +533,6 @@ def main():
 
     if rank == 0:
         print(f"Starting final evaluation...")
-
-    train_results_combined = pd.read_csv(train_results_path, sep='\t')
-    train_final_metrics = compute_final_metrics(train_results_combined)
-    train_final_metrics.to_csv(os.path.join(arguments.folder, 'train_metrics.tsv'), sep='\t', index=False)
     
     perform_test, test_time, test_time, test_results_df = forward_epoch(
         df_test, config, transformer_model, classification_model, criterion, 
@@ -537,8 +540,6 @@ def main():
         )
     
     test_results_df.to_csv(os.path.join(arguments.folder, 'test_results.tsv'), sep='\t', index=False)
-    test_final_metrics = compute_final_metrics(test_results_df)
-    test_final_metrics.to_csv(os.path.join(arguments.folder, 'test_metrics.tsv'), sep='\t', index=False)
 
 if __name__ == '__main__':
     main()
