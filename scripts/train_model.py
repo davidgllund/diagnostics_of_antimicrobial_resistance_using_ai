@@ -112,9 +112,7 @@ def load_previous_state(model_folder, n_epochs, rank=0):
     val_results_path = os.path.join(model_folder, "validation_results.tsv")
 
     train_loss = torch.zeros((n_epochs, 1))
-    train_acc = torch.zeros((n_epochs, 1))
     val_loss = torch.zeros((n_epochs, 1))
-    val_acc = torch.zeros((n_epochs, 1))
 
     start_epoch = 0
     min_val_loss = 1000
@@ -125,7 +123,7 @@ def load_previous_state(model_folder, n_epochs, rank=0):
     if not os.path.exists(train_results_path) or not os.path.exists(val_results_path):
         if rank == 0:
             print("No previous logs found. Starting from scratch.")
-        return train_loss, train_acc, val_loss, val_acc, start_epoch, avg_batch_time, total_time, processed_batches, min_val_loss
+        return train_loss, val_loss, start_epoch, avg_batch_time, total_time, processed_batches, min_val_loss
     
     df_train_log = pd.read_csv(train_results_path, sep="\t")
     df_val_log   = pd.read_csv(val_results_path, sep="\t")
@@ -133,7 +131,7 @@ def load_previous_state(model_folder, n_epochs, rank=0):
     if df_train_log.empty or df_val_log.empty:
         if rank == 0:
             print("Log files empty. Starting from scratch.")
-        return train_loss, train_acc, val_loss, val_acc, start_epoch, avg_batch_time, total_time, processed_batches, min_val_loss
+        return train_loss, val_loss, start_epoch, avg_batch_time, total_time, processed_batches, min_val_loss
     
     last_train_epoch = df_train_log["epoch"].max()
     last_val_epoch   = df_val_log["epoch"].max()
@@ -144,12 +142,10 @@ def load_previous_state(model_folder, n_epochs, rank=0):
         g_val   = df_val_log[df_val_log["epoch"] == e]
 
         if not g_train.empty:
-            train_loss[e] = g_train["loss"].mean()
-            train_acc[e]  = (g_train["true"] == g_train["pred"]).mean()
+            train_loss[e] = g_train["loss_mean"].mean()
 
         if not g_val.empty:
-            val_loss[e] = g_val["loss"].mean()
-            val_acc[e]  = (g_val["true"] == g_val["pred"]).mean()
+            val_loss[e] = g_val["loss_mean"].mean()
 
     # Best validation loss so far
     min_val_loss = float(val_loss[: last_epoch + 1].min())
@@ -158,7 +154,7 @@ def load_previous_state(model_folder, n_epochs, rank=0):
         print(f"Resuming training from epoch {last_epoch + 1} (min val loss: {min_val_loss:.4f})")
 
     start_epoch = last_epoch + 1
-    return train_loss, train_acc, val_loss, val_acc, start_epoch, avg_batch_time, total_time, processed_batches, min_val_loss
+    return train_loss, val_loss, start_epoch, avg_batch_time, total_time, processed_batches, min_val_loss
 
 def start_optimizer_loss(config, transformer, classification_model, rank=0):
     if rank == 0:
@@ -435,7 +431,7 @@ def main():
     criterion, optimizer = start_optimizer_loss(config, transformer_model, classification_model, rank)
 
     n_epochs = config['train']['n_epochs']
-    train_loss, train_acc, val_loss, val_acc, start_epoch, avg_batch_time, total_time, processed_batches, min_val_loss = load_previous_state(
+    train_loss, val_loss, start_epoch, avg_batch_time, total_time, processed_batches, min_val_loss = load_previous_state(
         arguments.folder, n_epochs, rank
     )
 
@@ -504,14 +500,10 @@ def main():
         print()
 
         avg_train_loss = torch.mean(perform_train[0, :])
-        avg_train_acc = torch.mean(perform_train[1, :])
         avg_val_loss = torch.mean(perform_val[0, :])
-        avg_val_acc = torch.mean(perform_val[1, :])
 
         train_loss[epoch] = avg_train_loss
-        train_acc[epoch] = avg_train_acc
         val_loss[epoch] = avg_val_loss
-        val_acc[epoch] = avg_val_acc
 
         if avg_val_loss < min_val_loss:
             min_val_loss = avg_val_loss
