@@ -108,8 +108,8 @@ def load_previous_state(model_folder, n_epochs, rank=0):
     if rank == 0:
         print('Checking for previous state...')
 
-    train_results_path = os.path.join(model_folder, "training_results.tsv")
-    val_results_path = os.path.join(model_folder, "validation_results.tsv")
+    train_results_path = os.path.join(model_folder, 'training_results.tsv')
+    val_results_path = os.path.join(model_folder, 'validation_results.tsv')
 
     train_loss = torch.zeros((n_epochs, 1))
     val_loss = torch.zeros((n_epochs, 1))
@@ -122,7 +122,7 @@ def load_previous_state(model_folder, n_epochs, rank=0):
 
     if not os.path.exists(train_results_path) or not os.path.exists(val_results_path):
         if rank == 0:
-            print("No previous logs found. Starting from scratch.")
+            print('No previous logs found. Starting from scratch.')
         return train_loss, val_loss, start_epoch, avg_batch_time, total_time, processed_batches, min_val_loss
     
     df_train_log = pd.read_csv(train_results_path, sep="\t")
@@ -130,28 +130,27 @@ def load_previous_state(model_folder, n_epochs, rank=0):
 
     if df_train_log.empty or df_val_log.empty:
         if rank == 0:
-            print("Log files empty. Starting from scratch.")
+            print('Log files empty. Starting from scratch.')
         return train_loss, val_loss, start_epoch, avg_batch_time, total_time, processed_batches, min_val_loss
     
-    last_train_epoch = df_train_log["epoch"].max()
-    last_val_epoch   = df_val_log["epoch"].max()
+    last_train_epoch = df_train_log['epoch'].max()
+    last_val_epoch   = df_val_log['epoch'].max()
     last_epoch = min(last_train_epoch, last_val_epoch)
 
     for e in range(last_epoch + 1):
-        g_train = df_train_log[df_train_log["epoch"] == e]
-        g_val   = df_val_log[df_val_log["epoch"] == e]
+        g_train = df_train_log[df_train_log['epoch'] == e]
+        g_val   = df_val_log[df_val_log['epoch'] == e]
 
         if not g_train.empty:
-            train_loss[e] = g_train["loss_mean"].mean()
+            train_loss[e] = g_train['loss_mean'].mean()
 
         if not g_val.empty:
-            val_loss[e] = g_val["loss_mean"].mean()
+            val_loss[e] = g_val['loss_mean'].mean()
 
-    # Best validation loss so far
     min_val_loss = float(val_loss[: last_epoch + 1].min())
 
     if rank == 0:
-        print(f"Resuming training from epoch {last_epoch + 1} (min val loss: {min_val_loss:.4f})")
+        print(f'Resuming training from epoch {last_epoch + 1} (min val loss: {min_val_loss:.4f})')
 
     start_epoch = last_epoch + 1
     return train_loss, val_loss, start_epoch, avg_batch_time, total_time, processed_batches, min_val_loss
@@ -269,7 +268,7 @@ def forward_epoch(df, config, transformer_model, classification_model, criterion
                 lambda_reg = config['vocab']['lambda_class_reg']
 
                 if lambda_reg > 0:
-                    abx_to_class = [ab_classes.get(abx, "unknown") for abx in antibiotics]
+                    abx_to_class = [ab_classes.get(abx, 'unknown') for abx in antibiotics]
                     class_to_indices = {}
                     for i, cls in enumerate(abx_to_class):
                         class_to_indices.setdefault(cls, []).append(i)
@@ -338,14 +337,14 @@ def forward_epoch(df, config, transformer_model, classification_model, criterion
         losses = np.array([])
 
     results_df = pd.DataFrame({
-        "species": all_species,
-        "antibiotic": all_antibiotics,
-        "true": trues,
-        "pred": preds,
-        "loss": losses,
-        "n_ast_results": all_n_ast,
-        "softmax_score": softmaxes[:, 1],
-        "epoch": epoch_idx
+        'species': all_species,
+        'antibiotic': all_antibiotics,
+        'true': trues,
+        'pred': preds,
+        'loss': losses,
+        'n_ast_results': all_n_ast,
+        'softmax_score': softmaxes[:, 1],
+        'epoch': epoch_idx
     })
 
     del token_ids, x_resp, x_pos, y_resp, y_pos, targets, transformer_pred, classification_pred, x, y, dataset, dataloader
@@ -353,7 +352,7 @@ def forward_epoch(df, config, transformer_model, classification_model, criterion
     gc.collect()
 
     class_metrics_df = compute_final_metrics(results_df)
-    class_metrics_df["epoch"] = epoch_idx
+    class_metrics_df['epoch'] = epoch_idx
 
     return (perform, sum(batch_times), len(batch_times), class_metrics_df)
 
@@ -368,10 +367,10 @@ def save_model(path, model):
 
 def compute_final_metrics(results_df):
     records = []
-    for (sp, abx, n_ast), g in results_df.groupby(["species", "antibiotic", "n_ast_results"]):
-        y_true = g["true"].astype(int)
-        y_pred = g["pred"].astype(int)
-        losses = g["loss"].astype(float)
+    for (sp, abx, n_ast), g in results_df.groupby(['species', 'antibiotic', 'n_ast_results']):
+        y_true = g['true'].astype(int)
+        y_pred = g['pred'].astype(int)
+        losses = g['loss'].astype(float)
 
         TP = ((y_true == 1) & (y_pred == 1)).sum()
         TN = ((y_true == 0) & (y_pred == 0)).sum()
@@ -384,17 +383,17 @@ def compute_final_metrics(results_df):
         acc = np.mean(y_true == y_pred)
 
         records.append({
-            "species": sp,
-            "antibiotic": abx,
-            "n_ast_results": n_ast,
-            "major_error": ME,
-            "very_major_error": VME,
-            "f1_score": f1,
-            "accuracy": acc,
-            "n_samples": len(g),
-            "loss_mean": losses.mean(),
-            "loss_median": losses.median(),
-            "loss_std": losses.std(),
+            'species': sp,
+            'antibiotic': abx,
+            'n_ast_results': n_ast,
+            'major_error': ME,
+            'very_major_error': VME,
+            'f1_score': f1,
+            'accuracy': acc,
+            'n_samples': len(g),
+            'loss_mean': losses.mean(),
+            'loss_median': losses.median(),
+            'loss_std': losses.std(),
         })
         
     return pd.DataFrame(records)
@@ -418,7 +417,7 @@ def main():
     df_test = df.loc[df['fold'].isin(['test'])]
 
     rank = 0
-    print("Initializing model...")
+    print('Initializing model...')
     transformer_model = create_transformer_model(config, pad_id, rank)
     classification_model = create_classification_model(config, rank)
 
@@ -439,10 +438,9 @@ def main():
     torch.manual_seed(2025)
     random.seed(2025)
 
-    train_results_path = os.path.join(arguments.folder, "training_results.tsv")
-    val_results_path = os.path.join(arguments.folder, "validation_results.tsv")
+    train_results_path = os.path.join(arguments.folder, 'training_results.tsv')
+    val_results_path = os.path.join(arguments.folder, 'validation_results.tsv')
 
-    # For progress reporting
     ema_batch_time = None
     obs_train = config['train']['obs_per_epoch']
     obs_val   = config['test']['obs_per_epoch']
@@ -521,10 +519,10 @@ def main():
         with open(os.path.join(arguments.folder, 'pretrain_state.pkl'), 'wb') as f:
             pkl.dump(state, f)
 
-    print("Training complete!")
+    print('Training complete!')
 
     if rank == 0:
-        print(f"Starting final evaluation...")
+        print(f'Starting final evaluation...')
     
     perform_test, test_time, test_time, test_results_df = forward_epoch(
         df_test, config, transformer_model, classification_model, criterion, 
