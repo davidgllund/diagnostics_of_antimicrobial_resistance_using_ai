@@ -13,7 +13,7 @@ import pandas as pd
 import random
 import gc
 
-from sklearn.metrics import f1_score
+from sklearn.metrics import f1_score, roc_curve
 from sys import argv
 from aux import ABTextDataset, expand_samples, to_device, append_df_to_tsv, update_ema, print_progress
 from model import Encoder, ABPred
@@ -169,7 +169,7 @@ def start_optimizer_loss(config, transformer, classification_model, rank=0):
     
     return criterion, optimizer
 
-def forward_epoch(df, config, transformer_model, classification_model, criterion, optimizer, epoch_idx, device, vocab, train=True):
+def forward_epoch(df, config, transformer_model, classification_model, criterion, optimizer, epoch_idx, device, vocab, train=True, test=False, thresholds=None):
 
     model_cfg = config['model']
     data_cfg = config['train'] if train else config['test']
@@ -306,10 +306,14 @@ def forward_epoch(df, config, transformer_model, classification_model, criterion
         perform[0, batch_idx] = loss_val
         perform[1, batch_idx] = acc
 
-        batch_preds_np = torch.argmax(classification_pred, dim=1).detach().cpu().numpy()
         batch_softmax_np = softmax_scores.detach().cpu().numpy()
         batch_targets_np = targets.detach().cpu().numpy()
         batch_losses_np = per_sample_losses.detach().cpu().numpy()
+
+        if thresholds is None:
+            batch_preds_np = torch.argmax(classification_pred, dim=1).detach().cpu().numpy()
+        else:
+            batch_preds_np = np.array([1 if s >= thresholds[ab] else 0 for s, ab in zip(batch_softmax_np[:,1], batch_antibiotics)])
 
         preds_list.append(batch_preds_np)
         softmax_list.append(batch_softmax_np)
@@ -354,6 +358,11 @@ def forward_epoch(df, config, transformer_model, classification_model, criterion
     class_metrics_df = compute_final_metrics(results_df)
     class_metrics_df['epoch'] = epoch_idx
 
+    if train is False and test is False:
+        thresholds = compute_classification_thresholds(results_df)
+        with open('thresholds.pkl', "wb") as f:
+            pkl.dump(thresholds, f)
+
     return (perform, sum(batch_times), len(batch_times), class_metrics_df)
 
 def save_model(path, model):
@@ -364,6 +373,25 @@ def save_model(path, model):
         state_dict = model.state_dict()
     
     torch.save(state_dict, path)
+
+def compute_classification_thresholds(df):
+    thresholds = {}
+    for ab, g in df.groupby('antibiotic'):
+        y_true = g['true'].values
+        y_score = g['softmax_score'].values
+
+        if len(np.unique(y_true)) < 2:
+            thresholds[ab] = 0.5
+            continue
+
+        fpr, tpr, thr = roc_curve(y_true, y_score)
+
+        dist = np.sqrt((1 - tpr)**2 + fpr**2)
+        best_point = thr[np.argmin(dist)]
+
+        thresholds[ab] = best_point
+    
+    return thresholds
 
 def compute_final_metrics(results_df):
     records = []
@@ -460,7 +488,7 @@ def main():
 
         perform_train, train_time, train_batch_count, train_results_df = forward_epoch(
             df_train, config, transformer_model, classification_model, criterion, 
-            optimizer, epoch, device, vocab, train=True
+            optimizer, epoch, device, vocab, train=True, test=False, thresholds=None 
         )
 
         per_batch_time = train_time / train_batch_count
@@ -479,7 +507,7 @@ def main():
 
         perform_val, val_time, val_batch_count, val_results_df = forward_epoch(
             df_val, config, transformer_model, classification_model, criterion, 
-            optimizer, epoch, device, vocab, train=False
+            optimizer, epoch, device, vocab, train=False, test=False, thresholds=None 
         )
 
         for _ in range(val_batch_count):
@@ -523,10 +551,16 @@ def main():
 
     if rank == 0:
         print(f'Starting final evaluation...')
-    
-    perform_test, test_time, test_time, test_results_df = forward_epoch(
-        df_test, config, transformer_model, classification_model, criterion, 
-            optimizer, n_epochs, device, vocab, train=False
+
+    with open(val_results_path, 'rb') as f:
+        val_results_df = pd.read_csv(f, sep='\t') 
+
+    with open('thresholds.pkl', 'rb') as f:
+        thresholds = pkl.load(f)
+
+    perform_test, _, _, test_results_df = forward_epoch(
+        df_test, config, transformer_model, classification_model, criterion,
+        optimizer, n_epochs, device, vocab, train=False, test=True, thresholds=thresholds
         )
     
     test_results_df.to_csv(os.path.join(arguments.folder, 'test_results.tsv'), sep='\t', index=False)
