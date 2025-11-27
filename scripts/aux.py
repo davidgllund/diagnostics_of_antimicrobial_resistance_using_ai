@@ -92,6 +92,7 @@ class ABTextDataset(Dataset):
         self.pos_response = pos_response
         self.pos_response_list  = list(pos_response.keys())
         self.species = [x[6] for x in X]
+        self.sample_type = [x[7] for x in X]
 
     def __len__(self):
         """Number of samples in the dataset."""
@@ -129,8 +130,9 @@ class ABTextDataset(Dataset):
         token_x = torch.tensor(self.vocab[token_x], dtype=torch.int64)
 
         species = self.species[idx]
+        sample_type = self.sample_type[idx]
 
-        return token_x, year, month, age, species, x_resp, x_pos, y_resp, y_pos
+        return token_x, year, month, age, species, sample_type, x_resp, x_pos, y_resp, y_pos
     
 class Vocab:
     """
