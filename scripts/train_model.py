@@ -13,7 +13,7 @@ import pandas as pd
 import random
 import gc
 
-from sklearn.metrics import f1_score, roc_curve
+from sklearn.metrics import f1_score, roc_curve, matthews_corrcoef
 from sys import argv
 from aux import ABTextDataset, expand_samples, to_device, append_df_to_tsv, update_ema, print_progress
 from model import Encoder, ABPred
@@ -108,8 +108,8 @@ def load_previous_state(model_folder, n_epochs, rank=0):
     if rank == 0:
         print('Checking for previous state...')
 
-    train_results_path = os.path.join(model_folder, 'training_results.tsv')
-    val_results_path = os.path.join(model_folder, 'validation_results.tsv')
+    train_results_path = os.path.join(model_folder, 'avg_train_performance.tsv')
+    val_results_path = os.path.join(model_folder, 'avg_val_performance.tsv')
 
     train_loss = torch.zeros((n_epochs, 1))
     val_loss = torch.zeros((n_epochs, 1))
@@ -134,7 +134,7 @@ def load_previous_state(model_folder, n_epochs, rank=0):
         return train_loss, val_loss, start_epoch, avg_batch_time, total_time, processed_batches, min_val_loss
     
     last_train_epoch = df_train_log['epoch'].max()
-    last_val_epoch   = df_val_log['epoch'].max()
+    last_val_epoch = df_val_log['epoch'].max()
     last_epoch = min(last_train_epoch, last_val_epoch)
 
     for e in range(last_epoch + 1):
@@ -142,10 +142,10 @@ def load_previous_state(model_folder, n_epochs, rank=0):
         g_val   = df_val_log[df_val_log['epoch'] == e]
 
         if not g_train.empty:
-            train_loss[e] = g_train['loss_mean'].mean()
+            train_loss[e] = g_train['avg_loss'].mean()
 
         if not g_val.empty:
-            val_loss[e] = g_val['loss_mean'].mean()
+            val_loss[e] = g_val['avg_loss'].mean()
 
     min_val_loss = float(val_loss[: last_epoch + 1].min())
 
@@ -201,17 +201,12 @@ def forward_epoch(df, config, transformer_model, classification_model, criterion
     transformer_model.train() if train else transformer_model.eval()
     classification_model.train() if train else classification_model.eval()
 
-    ab_weights_cfg = config['train'].get('ab_weights', {})
-    ab_weight_map = {}
-    for sp, wt_map in ab_weights_cfg.items():
-        for k, v in wt_map.items():
-            ab_weight_map[(sp, k)] = v
-
     preds_list = []
     softmax_list = []
     trues_list = []
     losses_list = []
     all_species = []
+    all_sample_types = []
     all_antibiotics = []
     all_n_ast = []
 
@@ -219,13 +214,14 @@ def forward_epoch(df, config, transformer_model, classification_model, criterion
 
     for batch_idx, batch in enumerate(dataloader):
         start_time = time.time()
-        token_ids, year, month, age, species_batch, x_resp, x_pos, y_resp, y_pos = to_device(batch, device)
+        token_ids, year, month, age, species_batch, sample_type_batch, x_resp, x_pos, y_resp, y_pos = to_device(batch, device)
         valid_lens = None
 
         ids = torch.nonzero(y_pos, as_tuple=False)[:, 1]
         targets = y_resp[y_pos].to(device)
 
         batch_species = np.concatenate([np.repeat(species_batch[i], int(y_pos[i].sum())) for i in range(len(y_pos))]).tolist()
+        batch_sample_type = np.concatenate([np.repeat(sample_type_batch[i], int(y_pos[i].sum())) for i in range(len(y_pos))]).tolist()
         batch_n_ast = np.concatenate([np.repeat(int(x_pos[i].sum().cpu().item()), int(y_pos[i].sum())) for i in range(len(y_pos))]).tolist()
 
         ids_cpu = ids.cpu().numpy()
@@ -244,24 +240,12 @@ def forward_epoch(df, config, transformer_model, classification_model, criterion
                 mask = (ids == r)
                 if mask.sum() == 0:
                     continue
-                base_losses = crit(classification_pred[mask], targets[mask])
-                
-                masked_indices = torch.nonzero(mask, as_tuple=False).squeeze(1).cpu().numpy()
-                if masked_indices.size == 0:
-                    continue
 
-                sample_weights  = np.empty((masked_indices.size,), dtype=np.float32)
-                for j, idx_in_flat in enumerate(masked_indices):
-                    sp = batch_species[int(idx_in_flat)]
-                    weights_list = ab_weight_map.get((sp, antibiotics[r]), [1.0, 1.0])
-                    class_idx = int(targets[mask][j].item())
-                    sample_weights[j] = np.sqrt(weights_list[class_idx]) if class_idx < len(weights_list) else 1.0
+                base_losses = crit(classification_pred[mask], targets[mask])
+                per_sample_losses[mask] += base_losses.detach()
                 
-                sample_weights_tensor = torch.from_numpy(sample_weights).to(device)
-                weighted_losses_mask = base_losses * sample_weights_tensor
-                per_sample_losses[mask] += weighted_losses_mask
-                weighted_loss = weighted_losses_mask.mean()
-                loss = weighted_loss if (loss is None) else loss + weighted_loss
+                ab_loss = base_losses.mean()
+                loss = ab_loss if loss is None else loss + ab_loss
 
             if train:
                 ab_classes = config['vocab']['ab_class']
@@ -321,6 +305,7 @@ def forward_epoch(df, config, transformer_model, classification_model, criterion
         losses_list.append(batch_losses_np)
         all_antibiotics.extend(batch_antibiotics)
         all_species.extend(batch_species)
+        all_sample_types.extend(batch_sample_type)
         all_n_ast.extend(batch_n_ast)
 
         batch_time = time.time() - start_time
@@ -343,6 +328,7 @@ def forward_epoch(df, config, transformer_model, classification_model, criterion
     results_df = pd.DataFrame({
         'species': all_species,
         'antibiotic': all_antibiotics,
+        'sample_type': all_sample_types,
         'true': trues,
         'pred': preds,
         'loss': losses,
@@ -395,7 +381,7 @@ def compute_classification_thresholds(df):
 
 def compute_final_metrics(results_df):
     records = []
-    for (sp, abx, n_ast), g in results_df.groupby(['species', 'antibiotic', 'n_ast_results']):
+    for (sp, abx, tpe, n_ast), g in results_df.groupby(['species', 'antibiotic', 'sample_type', 'n_ast_results']):
         y_true = g['true'].astype(int)
         y_pred = g['pred'].astype(int)
         losses = g['loss'].astype(float)
@@ -405,19 +391,15 @@ def compute_final_metrics(results_df):
         FP = ((y_true == 0) & (y_pred == 1)).sum()
         FN = ((y_true == 1) & (y_pred == 0)).sum()
 
-        ME = FP / (FP + TN) if (FP + TN) > 0 else np.nan
-        VME = FN / (FN + TP) if (FN + TP) > 0 else np.nan
-        f1 = f1_score(y_true, y_pred, zero_division=0)
-        acc = np.mean(y_true == y_pred)
-
         records.append({
             'species': sp,
             'antibiotic': abx,
+            'sample_type': tpe,
             'n_ast_results': n_ast,
-            'major_error': ME,
-            'very_major_error': VME,
-            'f1_score': f1,
-            'accuracy': acc,
+            'TP': TP,
+            'TN': TN,
+            'FP': FP,
+            'FN': FN,
             'n_samples': len(g),
             'loss_mean': losses.mean(),
             'loss_median': losses.median(),
@@ -467,7 +449,9 @@ def main():
     random.seed(2025)
 
     train_results_path = os.path.join(arguments.folder, 'training_results.tsv')
+    train_perf_path = os.path.join(arguments.folder, 'avg_train_performance.tsv')
     val_results_path = os.path.join(arguments.folder, 'validation_results.tsv')
+    val_perf_path = os.path.join(arguments.folder, 'avg_val_performance.tsv')
 
     ema_batch_time = None
     obs_train = config['train']['obs_per_epoch']
@@ -501,7 +485,18 @@ def main():
                         ema_batch_time, epoch_start)
 
         append_df_to_tsv(train_results_path, train_results_df)
-        del train_results_df
+
+        avg_train_results = pd.DataFrame({
+            'avg_loss': perform_train[0, :].mean().unsqueeze(0),
+            'std_loss': perform_train[0, :].std().unsqueeze(0),
+            'avg_acc': perform_train[1, :].mean().unsqueeze(0),
+            'std_acc': perform_train[1, :].std().unsqueeze(0),
+            'epoch': torch.tensor([epoch], dtype=torch.int32)
+        })
+
+        append_df_to_tsv(train_perf_path, avg_train_results)
+
+        del train_results_df, avg_train_results
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -519,17 +514,24 @@ def main():
                         ema_batch_time, epoch_start)
 
         append_df_to_tsv(val_results_path, val_results_df)
+
+        avg_val_results = pd.DataFrame({
+            'avg_loss': perform_val[0, :].mean().unsqueeze(0),
+            'std_loss': perform_val[0, :].std().unsqueeze(0),
+            'avg_acc': perform_val[1, :].mean().unsqueeze(0),
+            'std_acc': perform_val[1, :].std().unsqueeze(0),
+            'epoch': torch.tensor([epoch], dtype=torch.int32)
+        })
+
+        append_df_to_tsv(val_perf_path, avg_val_results)
+
         del val_results_df
         gc.collect()
         torch.cuda.empty_cache()
 
         print()
-
-        avg_train_loss = torch.mean(perform_train[0, :])
+        
         avg_val_loss = torch.mean(perform_val[0, :])
-
-        train_loss[epoch] = avg_train_loss
-        val_loss[epoch] = avg_val_loss
 
         if avg_val_loss < min_val_loss:
             min_val_loss = avg_val_loss
