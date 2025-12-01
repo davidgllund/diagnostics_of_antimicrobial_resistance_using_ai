@@ -42,10 +42,6 @@ def preprocess_data(df, ab_abbrev, sp_abbrev, sample_categ):
     sp_dict = read_dict(sp_abbrev)
     sample_dict = read_dict(sample_categ)
 
-    #df = df[df['antibiotikum_namn'].isin(ab_dict.keys())]
-    #df = df[df['smittamne_namn'].isin(sp_dict.keys())]
-    #df = df[df['provmaterial_namn'].isin(sample_dict.keys())]
-
     df['antibiotic_short'] = [ab_dict[x] if x in ab_dict.keys() else x for x in df['antibiotikum_namn']]
     df['species_short'] = [sp_dict[x] if x in sp_dict.keys() else x for x in df['smittamne_namn']]
     df['sample'] = [sample_dict[x] if x in sample_dict.keys() else x for x in df['provmaterial_namn']]
@@ -119,7 +115,6 @@ def count_antibiotics(sentence, n_metadata):
 def main():
     arguments = parse_args(argv)
     data = pd.read_csv(arguments.input, sep='\t')
-    data.replace(np.nan, '<unk>', inplace=True)
 
     print('Preprocessing data')
     df = preprocess_data(data, arguments.ab_abbrev, arguments.sp_abbrev, arguments.sample_categ)
