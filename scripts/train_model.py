@@ -169,6 +169,39 @@ def start_optimizer_loss(config, transformer, classification_model, rank=0):
     
     return criterion, optimizer
 
+def _apply_class_regularization(classification_pred, ids, antibiotics, ab_classes, lambda_reg, device):
+    abx_to_class = [ab_classes.get(abx, 'unknown') for abx in antibiotics]
+
+    class_to_idxs = {}
+    for i, cls in enumerate(abx_to_class):
+        class_to_idxs.setdefault(cls, []).append(i)
+
+    class_means = {}
+    for cls, idxs in class_to_idxs.items():
+        if len(idxs) < 2:
+            continue
+
+        mask_cls = torch.isin(ids, torch.tensor(idxs, device=device))
+        class_logits = classification_pred[mask_cls]
+        if class_logits.size(0) > 0:
+            class_means[cls] = class_logits.mean(dim=0)
+
+    reg_loss = torch.tensor(0.0, device=device)
+    for cls, idxs in class_to_idxs.items():
+        if cls not in class_means:
+            continue
+
+        for i in idxs:
+            abx_mask = (ids == i)
+            if abx_mask.sum() == 0:
+                continue
+
+            abx_logits = classification_pred[abx_mask]
+            reg_loss += ((abx_logits - class_means[cls]) ** 2).mean()
+
+    reg_loss = lambda_reg * reg_loss
+    return reg_loss
+
 def forward_epoch(df, config, transformer_model, classification_model, criterion, optimizer, epoch_idx, device, vocab, train=True, test=False, thresholds=None):
 
     model_cfg = config['model']
@@ -252,32 +285,7 @@ def forward_epoch(df, config, transformer_model, classification_model, criterion
                 lambda_reg = config['vocab']['lambda_class_reg']
 
                 if lambda_reg > 0:
-                    abx_to_class = [ab_classes.get(abx, 'unknown') for abx in antibiotics]
-                    class_to_indices = {}
-                    for i, cls in enumerate(abx_to_class):
-                        class_to_indices.setdefault(cls, []).append(i)
-
-                    class_means = {}
-                    for cls, idxs in class_to_indices.items():
-                        if len(idxs) < 2:
-                            continue
-                        mask_cls = (ids.unsqueeze(1) == torch.tensor(idxs, device=device)).any(dim=1)
-                        class_logits = classification_pred[mask_cls]
-                        if class_logits.size(0) > 0:
-                            class_means[cls] = class_logits.mean(dim=0)
-
-                    reg_loss = torch.tensor(0.0, device=device)
-                    for cls, idxs in class_to_indices.items():
-                        if cls not in class_means:
-                            continue
-                        for i in idxs:
-                            abx_mask = (ids == i)
-                            if abx_mask.sum() == 0:
-                                continue
-                            abx_logits = classification_pred[abx_mask]
-                            reg_loss += ((abx_logits - class_means[cls]) ** 2).mean()
-
-                    reg_loss = lambda_reg * reg_loss
+                    reg_loss = _apply_class_regularization(classification_pred, ids, antibiotics, ab_classes, lambda_reg, device)
                     loss = loss + reg_loss
             
             if train:
