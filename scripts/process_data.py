@@ -3,6 +3,7 @@ import argparse
 import torch
 import pandas as pd
 import random
+import numpy as np
 from collections import Counter
 from tqdm import tqdm
 from sys import argv
@@ -36,28 +37,25 @@ def read_dict(filename):
             dictionary[items[0]] = items[1].strip()      
     return dictionary
 
-def format_date(name: str):
-    parts = str(name).split('-')
-    return parts[0], parts[1].replace('0','')
-
 def preprocess_data(df, ab_abbrev, sp_abbrev, sample_categ): 
     ab_dict = read_dict(ab_abbrev)
     sp_dict = read_dict(sp_abbrev)
     sample_dict = read_dict(sample_categ)
 
-    df = df[df['antibiotikum_namn'].isin(ab_dict.keys())]
-    df = df[df['smittamne_namn'].isin(sp_dict.keys())]
-    df = df[df['provmaterial_namn'].isin(sample_dict.keys())]
+    #df = df[df['antibiotikum_namn'].isin(ab_dict.keys())]
+    #df = df[df['smittamne_namn'].isin(sp_dict.keys())]
+    #df = df[df['provmaterial_namn'].isin(sample_dict.keys())]
 
-    df['antibiotic_short'] = [ab_dict[x] for x in df['antibiotikum_namn']]
-    df['species_short'] = [sp_dict[x] for x in df['smittamne_namn']]
-    df['sample'] = [sample_dict[x] for x in df['provmaterial_namn']]
+    df['antibiotic_short'] = [ab_dict[x] if x in ab_dict.keys() else x for x in df['antibiotikum_namn']]
+    df['species_short'] = [sp_dict[x] if x in sp_dict.keys() else x for x in df['smittamne_namn']]
+    df['sample'] = [sample_dict[x] if x in sample_dict.keys() else x for x in df['provmaterial_namn']]
 
-    df[['year', 'month']] = df['provtagnings_datum'].apply(
-        lambda x: pd.Series(format_date(x))
-    )
+    df['provtagnings_datum'] = pd.to_datetime(df['provtagnings_datum'], errors='coerce')
 
-    df['patient_alder'] = df['patient_alder'].astype(str)
+    df['year'] = df['provtagnings_datum'].dt.year.astype(str)
+    df['month'] = df['provtagnings_datum'].dt.month.astype(str)
+
+    df['patient_alder'] = [x.split('.')[0] for x in df['patient_alder'].astype(str)]
     df['patient_kon'] = df['patient_kon'].astype(str)
 
     return df
@@ -121,6 +119,7 @@ def count_antibiotics(sentence, n_metadata):
 def main():
     arguments = parse_args(argv)
     data = pd.read_csv(arguments.input, sep='\t')
+    data.replace(np.nan, '<unk>', inplace=True)
 
     print('Preprocessing data')
     df = preprocess_data(data, arguments.ab_abbrev, arguments.sp_abbrev, arguments.sample_categ)
