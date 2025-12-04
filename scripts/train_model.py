@@ -305,7 +305,10 @@ def forward_epoch(df, config, transformer_model, classification_model, criterion
         if thresholds is None:
             batch_preds_np = torch.argmax(classification_pred, dim=1).detach().cpu().numpy()
         else:
-            batch_preds_np = np.array([1 if s >= thresholds[ab] else 0 for s, ab in zip(batch_softmax_np[:,1], batch_antibiotics)])
+            batch_preds_np = np.array([
+                1 if s >= thresholds.get((ab, sp), 0.5) else 0
+                for s, ab, sp in zip(batch_softmax_np[:, 1], batch_antibiotics, batch_species)
+            ])
 
         preds_list.append(batch_preds_np)
         softmax_list.append(batch_softmax_np)
@@ -370,7 +373,7 @@ def save_model(path, model):
 
 def compute_classification_thresholds(df):
     thresholds = {}
-    for ab, g in df.groupby('antibiotic'):
+    for ab, g in df.groupby(['antibiotic', 'species']):
         y_true = g['true'].values
         y_score = g['softmax_score'].values
 
