@@ -2,154 +2,214 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers import AutoModel, AutoConfig
+from typing import Optional
 
-def masked_softmax(X, valid_lens=None):
-    if valid_lens is None:
-        return F.softmax(X, dim=-1)
-    
-    batch_pad = torch.where(torch.sum(valid_lens==0,1) > 0)[0]
-    pos_pad = torch.sum(valid_lens==0,1)[torch.sum(valid_lens==0,1) > 0]
-
-    batch_pad = torch.repeat_interleave(batch_pad, pos_pad, dim=0)
-    pos_pad = torch.where(valid_lens==0, torch.arange(valid_lens.shape[1]), -1).reshape(-1)[torch.where(valid_lens==0, torch.arange(valid_lens.shape[1]), -1).reshape(-1) >= 0]
-
-    X[batch_pad,:,pos_pad,:] = -1e8
-
-    return F.softmax(X, dim=-1)
-
-class MultiHeadAttention(nn.Module):
-    def __init__(self, hidden_size, n_heads, max_seq_len, self_attn_size, dropout_rate_attn, layer_norm_eps) -> None:
-        super().__init__()
-
-        assert hidden_size % n_heads == 0, \
-            'Model dimension must be divisible by the number of attention heads.'
-
-        self.d_model = hidden_size
-        self.num_heads = n_heads
-        self.seq_len = max_seq_len
-        self.d_k = self_attn_size
-
-        self.W_q = nn.Linear(self.d_model, self.num_heads * self.d_k, bias=False)
-        self.W_k = nn.Linear(self.d_model, self.num_heads * self.d_k, bias=False)
-        self.W_v = nn.Linear(self.d_model, self.num_heads * self.d_k, bias=False)
-        self.W_o = nn.Linear(self.num_heads * self.d_k, self.d_model, bias=False)
-
-        self.dropout_attn = nn.Dropout(dropout_rate_attn)
-        self.dropout_out = nn.Dropout(dropout_rate_attn)
-        self.layer_norm = nn.LayerNorm(self.d_model, eps = layer_norm_eps)
-
-    def forward(self, x, valid_lens=None):
-        residual = x
-        batch_size, seq_len, _ = x.size()
-
-        Q = self.W_q(x).view(batch_size, seq_len, self.num_heads, self.d_k)
-        K = self.W_k(x).view(batch_size, seq_len, self.num_heads, self.d_k)
-        V = self.W_v(x).view(batch_size, seq_len, self.num_heads, self.d_k)
-        Q, K, V = Q.transpose(1,2), K.transpose(1,2), V.transpose(1,2)
-
-        scores = torch.matmul(Q / self.d_k ** 0.5, K.transpose(2, 3))
-        attn_weights = masked_softmax(scores, valid_lens)
-        attn_weights = self.dropout_attn(attn_weights)
-
-        output = torch.matmul(attn_weights, V)
-        output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
-        output = self.W_o(output)
-
-        output = self.layer_norm(self.dropout_out(output) + residual)
-        return output
-
-class PositionWiseFeedForward(nn.Module):
-    def __init__(self, hidden_size, ffn_dimension, dropout_rate_pwff, layer_norm_eps):
-        super().__init__()
-
-        self.W_1 = nn.Linear(hidden_size, ffn_dimension)
-        self.W_2 = nn.Linear(ffn_dimension, hidden_size)
-        self.relu = nn.ReLU()
-        self.layer_norm = nn.LayerNorm(hidden_size, eps = layer_norm_eps)
-        self.dropout = nn.Dropout(dropout_rate_pwff)
-
-    def forward(self, x):
-        residual = x
-        x = self.W_2(self.relu(self.W_1(x)))
+class TransformerEncoder(nn.Module):
+    def __init__(self, embedding_size, n_heads, encoder_stack_depth, ffn_dimension, max_seq_len, vocab_size, 
+                 pad_id, dropout_rate_attn, layer_norm_eps, model_name="bert-base-uncased"):
+        """
+        Initialize transformer encoder.
         
-        return self.layer_norm(self.dropout(x) + residual)
-    
-class SingleLayerEncoder(nn.Module):
-    def __init__(self, hidden_size, n_heads, max_seq_len, self_attn_size, ffn_dimension, layer_norm_eps, dropout_rate_attn, dropout_rate_pwff):
+        Args:
+            embedding_size: Embedding size
+            n_heads: Number of attention heads
+            encoder_stack_depth: Number of transformer layers
+            ffn_dimension: Feed-forward network dimension
+            max_seq_len: Maximum sequence length
+            vocab_size: Vocabulary size
+            pad_id: Padding token ID
+            dropout_rate_attn: Attention dropout rate
+            layer_norm_eps: Layer norm epsilon
+            model_name: HuggingFace model name (optional - can use custom config instead)
+        """
         super().__init__()
-
-        self.attn = MultiHeadAttention(hidden_size, n_heads, max_seq_len, self_attn_size, dropout_rate_attn, layer_norm_eps)
-        self.ffn = PositionWiseFeedForward(hidden_size, ffn_dimension, dropout_rate_pwff, layer_norm_eps)
-
-    def forward(self, x, valid_lens=None):
-        output = self.attn(x, valid_lens)
-        output = self.ffn(output)
-
-        return output
-
-class Embeddings(nn.Module):
-    def __init__(self, vocab_size, hidden_size, dropout_rate, layer_norm_eps, pad_id):
-        super().__init__()
-
-        self.token_embeddings = nn.Embedding(vocab_size, hidden_size, padding_idx=pad_id)
-        self.layer_norm = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
-        self.dropout = nn.Dropout(dropout_rate)
-
-    def forward(self, token_ids):
-        token_embeddings = self.token_embeddings(token_ids)
-        embeddings = self.layer_norm(self.dropout(token_embeddings))
-
-        return embeddings
-
-class Encoder(nn.Module):
-    def __init__(self, encoder_stack_depth, hidden_size, n_heads, max_seq_len, self_attn_size, ffn_dimension, layer_norm_eps, dropout_rate_attn, dropout_rate_pwff, vocab_size, pad_id):
-        super().__init__()
-
+        
         self.pad_idx = pad_id
-        self.embedding_layer = Embeddings(vocab_size, hidden_size, dropout_rate_attn, layer_norm_eps, pad_id)
-        self.year_proj = nn.Linear(1, hidden_size)
-        self.month_proj = nn.Linear(1, hidden_size)
-        self.age_proj = nn.Linear(1, hidden_size)
+        self.embedding_size = embedding_size
         
-        self.blks = nn.Sequential()
-        for i in range(encoder_stack_depth):
-            self.blks.add_module(f"i{i}", SingleLayerEncoder(hidden_size, n_heads, max_seq_len, self_attn_size, ffn_dimension, layer_norm_eps, dropout_rate_attn, dropout_rate_pwff))
+        n_continuous = 3
 
-    def forward(self, token_ids, year, month, age, valid_lens=None):
-        x = self.embedding_layer(token_ids)
+        # Create custom config for transformer
+        config = AutoConfig.from_pretrained(
+            model_name,
+            vocab_size=vocab_size,
+            max_position_embeddings=max_seq_len + n_continuous,
+            hidden_size=embedding_size,
+            num_hidden_layers=encoder_stack_depth,
+            num_attention_heads=n_heads,
+            intermediate_size=ffn_dimension,
+            hidden_dropout_prob=dropout_rate_attn,
+            attention_probs_dropout_prob=dropout_rate_attn,
+            initializer_range=0.02,
+            layer_norm_eps=layer_norm_eps,
+            pad_token_id=pad_id,
+            position_embeddings_type="none"
+        )
+
+        # Load transformer model with custom config
+        self.transformer = AutoModel.from_config(config)
+
+        # Token embedding layer (same as transformer's)
+        self.token_embedding = nn.Embedding(vocab_size, embedding_size, padding_idx=pad_id)
+
+        # Continuous feature projections
+        self.year_proj = nn.Linear(1, embedding_size)
+        self.month_proj = nn.Linear(1, embedding_size)
+        self.age_proj = nn.Linear(1, embedding_size)
+        
+    def forward(self, token_ids, year, month, age, attention_mask):
+        """
+        Forward pass through the encoder.
+        
+        Args:
+            token_ids: Token indices [batch_size, seq_len]
+            year: Year values [batch_size, 1]
+            month: Month values [batch_size, 1]
+            age: Age values [batch_size, 1]
+            attention_mask: Mask for <pad> tokens [batch_size, seq_len + 3] (1 for real tokens/features, 0 for padding)
+            
+        Returns:
+            Encoded representations [batch_size, seq_len + 3, embedding_size]
+        """
+        
+        # Embed tokens
+        token_embeds = self.token_embedding(token_ids)
+
+        # Project continuous features
         year_emb = self.year_proj(year)
         month_emb = self.month_proj(month)
         age_emb = self.age_proj(age)
+        continuous_embeds = torch.stack([year_emb, month_emb, age_emb], dim=1)
 
-        cont_emb = torch.stack([year_emb, month_emb, age_emb], dim=1)
-        x = torch.cat([cont_emb, x], dim=1)
-        for blk in self.blks:
-            x = blk(x, valid_lens)
+        # Concatenate continuous features and token embeddings
+        input_embeds = torch.cat([continuous_embeds, token_embeds], dim=1)
 
+        # Pass through transformer
+        transformer_output = self.transformer(
+            inputs_embeds=input_embeds,
+            attention_mask=attention_mask
+        )
+        x = transformer_output.last_hidden_state
         return x
-    
+
+
 class AntibioticClassifier(nn.Module):
-    def __init__(self, hidden_size, n_outputs, layer_norm_eps) -> None:
+    """
+    Classification head for a single antibiotic.
+    """
+    def __init__(self, embedding_size, n_outputs, layer_norm_eps):
+        """
+        Initialize antibiotic classifier.
+        
+        Args:
+            embedding_size: Input embedding size
+            n_outputs: Number of output classes
+            layer_norm_eps: Layer normalization epsilon
+        """
         super().__init__()
-
-        self.mlm = nn.Sequential(nn.Linear(hidden_size, hidden_size), nn.ReLU(), 
-                                 nn.LayerNorm(hidden_size, eps=layer_norm_eps), nn.Linear(hidden_size, n_outputs))
-
-    def forward(self, x):
-        x = self.mlm(x)
-
-        return x
+        
+        self.classification_head = nn.Sequential(
+            nn.Linear(embedding_size, embedding_size),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.LayerNorm(embedding_size, eps=layer_norm_eps),
+            nn.Linear(embedding_size, n_outputs)
+        )
     
-class ABPred(nn.Module):
-    def __init__(self, hidden_size, n_antibiotics=37, n_outputs=2, layer_norm_eps=0.00001, **kwargs):
-        super(ABPred, self).__init__(**kwargs)
-
-        self.nn_stack = nn.ModuleList([AntibioticClassifier(hidden_size, n_outputs, layer_norm_eps) for _ in range(n_antibiotics)])
-
-    def forward(self, X, positions_y):
-        outs = [layer(X) for layer in self.nn_stack]
-        ab_Y_hat = torch.cat(outs, dim=1)
+    def forward(self, x):
+        """
+        Forward pass through classifier.
+        
+        Args:
+            x: Input tensor [batch_size, seq_len, embedding_size]
             
-        Y_hat = ab_Y_hat[positions_y]
+        Returns:
+            Classification logits [batch_size, n_outputs]
+        """
+        return self.classification_head(x)
 
-        return Y_hat
+
+class AMRPredictionModel(nn.Module):
+    """
+    Antibiotic prediction model using HuggingFace transformers encoder.
+    Maintains same interface as original ABPred but with transformer-based backend.
+    """
+    def __init__(self, embedding_size, n_antibiotics, n_outputs, layer_norm_eps, n_heads, encoder_stack_depth, 
+                 ffn_dimension, max_seq_len, vocab_size, pad_id, dropout_rate_attn, **kwargs):
+        """
+        Initialize ABPred model.
+        
+        Args:
+            embedding_size: Embedding size
+            n_antibiotics: Number of antibiotics to predict (default 37)
+            n_outputs: Number of output classes per antibiotic (default 2)
+            layer_norm_eps: Layer normalization epsilon
+            n_heads: Number of attention heads
+            encoder_stack_depth: Number of transformer layers
+            ffn_dimension: Feed-forward network dimension
+            max_seq_len: Maximum sequence length
+            vocab_size: Vocabulary size
+            pad_id: Padding token ID
+            dropout_rate_attn: Attention dropout rate
+            dropout_rate_pwff: Deprecated - kept for compatibility, not used (HuggingFace uses unified dropout)
+        """
+        super().__init__(**kwargs)
+        
+        # Initialize transformer encoder
+        self.encoder = TransformerEncoder(
+            embedding_size=embedding_size,
+            n_heads=n_heads,
+            encoder_stack_depth=encoder_stack_depth,
+            ffn_dimension=ffn_dimension,
+            max_seq_len=max_seq_len,
+            vocab_size=vocab_size,
+            pad_id=pad_id,
+            dropout_rate_attn=dropout_rate_attn,
+            layer_norm_eps=layer_norm_eps
+        )
+        
+        # One classifier per antibiotic
+        self.classifiers = nn.ModuleList([
+            AntibioticClassifier(embedding_size, n_outputs, layer_norm_eps) 
+            for _ in range(n_antibiotics)
+        ])
+        
+        self.n_antibiotics = n_antibiotics
+    
+    def forward(self, token_ids, year, month, age, positions_y, attention_mask):
+        """
+        Forward pass through the model.
+        
+        Args:
+            token_ids: Token indices [batch_size, seq_len]
+            year: Year values [batch_size, 1]
+            month: Month values [batch_size, 1]
+            age: Age values [batch_size, 1]
+            positions_y: Boolean tensor indicating which antibiotics to predict [batch_size, n_antibiotics]
+            attention_mask: Mask for <pad>
+            
+        Returns:
+            Predictions for requested antibiotics [n_positive_positions, n_outputs]
+        """
+        # Encode input
+        encoded_representations = self.encoder(token_ids, year, month, age, attention_mask)
+        
+        # Get [CLS] token representation
+        cls_representation = encoded_representations[:, 3:4, :]
+        
+        # Run all classifiers
+        all_logits = []
+        for classifier in self.classifiers:
+            antibiotic_logits = classifier(cls_representation)
+            all_logits.append(antibiotic_logits)
+        
+        # Concatenate all predictions
+        all_antibiotic_logits = torch.cat(all_logits, dim=1)
+        
+        # Select only the requested positions
+        #output_logits = all_antibiotic_logits[positions_y]
+        output_logits = all_antibiotic_logits * positions_y.unsqueeze(-1)
+        
+        return output_logits
+    
