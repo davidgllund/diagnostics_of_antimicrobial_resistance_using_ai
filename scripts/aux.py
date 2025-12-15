@@ -1,14 +1,16 @@
 #!/usr/bin/env python
 import torch
-from torch.utils.data import Dataset
 import pandas as pd
 import numpy as np
-from collections import Counter
 import random
 import os
 import time
 
-def expand_samples(dataset, isolates_per_batch, n_metadata, seed):
+from collections import Counter
+from collections import defaultdict
+from torch.utils.data import Dataset
+
+def expand_samples(dataset, isolates_per_batch, n_metadata, seed, max_expansions=5, max_predictor_antibiotics=8):
     if seed is None:
         seed = random.randint(1, 10**18)
 
@@ -26,9 +28,20 @@ def expand_samples(dataset, isolates_per_batch, n_metadata, seed):
         antibiotics = isolate[n_metadata:]
         n_antibiotics = len(antibiotics)
 
-        for i in range(n_antibiotics):
+        possible_indices = list(range(n_antibiotics))
+
+        if n_antibiotics > max_expansions:
+            chosen_indices = np.random.choice(
+                possible_indices, size=max_expansions, replace=False
+            )
+        else:
+            chosen_indices = possible_indices
+
+        for i in chosen_indices:
+            i_capped = min(i, max_predictor_antibiotics, n_antibiotics)
+
             predictor_indices = np.sort(
-                np.random.choice(n_antibiotics, size=i, replace=False)
+                np.random.choice(n_antibiotics, size=i_capped, replace=False)
             )
             selected_antibiotics = [antibiotics[j] for j in predictor_indices]
 
@@ -39,8 +52,45 @@ def expand_samples(dataset, isolates_per_batch, n_metadata, seed):
 
             all_predictors.append(predictors)
             all_responses.append(response)
+
+            if i_capped == max_predictor_antibiotics:
+                break
         
     return all_predictors, all_responses
+
+def get_balanced_indices(x, y, obs_per_epoch):
+    length_buckets = defaultdict(list)
+    for i, xi in enumerate(x):
+        length_buckets[len(xi)].append(i)
+
+    total_samples = min(len(y), obs_per_epoch)
+    unique_lengths = list(length_buckets.keys())
+    k = len(unique_lengths)
+
+    base_n = total_samples // k
+    remainder = total_samples % k
+
+    selected_indices = []
+
+    for length in unique_lengths:
+        bucket = length_buckets[length]
+
+        target = base_n + (1 if remainder > 0 else 0)
+        if remainder > 0:
+            remainder -= 1
+
+        sample_size = min(len(bucket), target)
+
+        chosen = np.random.choice(bucket, size=sample_size, replace=False)
+        selected_indices.extend(chosen.tolist())
+
+    if len(selected_indices) < total_samples:
+        remaining_pool = list(set(range(len(y))) - set(selected_indices))
+        needed = total_samples - len(selected_indices)
+        filler = np.random.choice(remaining_pool, size=needed, replace=False)
+        selected_indices.extend(filler.tolist())
+
+    return selected_indices
 
 def to_device(batch, device):
     res = []
@@ -49,17 +99,17 @@ def to_device(batch, device):
             res.append(item.to(device, non_blocking=True))
         else:
             res.append(item)
+
     return tuple(res)
 
 def append_df_to_tsv(path, df, sep='\t'):
-    """Append df to path. Writes header if file does not exist."""
     write_header = not os.path.exists(path)
-    # Use mode 'a' (append) for speed and low memory
     df.to_csv(path, mode='a', sep=sep, header=write_header, index=False)
 
 def update_ema(ema, value, alpha=0.05):
     if ema is None:
         return value
+    
     return (1 - alpha) * ema + alpha * value
 
 def print_progress(epoch, step_in_epoch, batches_per_epoch,
@@ -158,12 +208,14 @@ class Vocab:
         """Returns indices for given token(s)."""
         if not isinstance(tokens, (list, tuple)):
             return self.token_to_idx.get(tokens, self.unk)
+        
         return [self.__getitem__(token) for token in tokens]
         
     def to_tokens(self, indices):
         """Converts indices back to tokens."""
         if hasattr(indices, '__len__') and len(indices) > 1:
             return [self.idx_to_token[int(index)] for index in indices]
+        
         return self.idx_to_token[indices]
         
     @property
