@@ -26,7 +26,7 @@ def parse_args(argv):
                         help='Name of output vocabulary file.')
 
     arguments = parser.parse_args()
-
+    
     return arguments
 
 def read_dict(filename):
