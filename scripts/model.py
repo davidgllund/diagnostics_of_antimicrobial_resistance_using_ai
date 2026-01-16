@@ -208,7 +208,6 @@ class AMRPredictionModel(nn.Module):
         all_antibiotic_logits = torch.cat(all_logits, dim=1)
         
         # Select only the requested positions
-        #output_logits = all_antibiotic_logits[positions_y]
         output_logits = all_antibiotic_logits * positions_y.unsqueeze(-1)
         
         return output_logits
