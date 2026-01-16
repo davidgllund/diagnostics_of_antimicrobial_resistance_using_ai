@@ -16,7 +16,7 @@ from transformers import get_linear_schedule_with_warmup
 from sklearn.metrics import roc_curve
 import sys
 from aux import ABTextDataset, expand_samples, get_balanced_indices, to_device, append_df_to_tsv, update_ema, print_progress
-from model_v2 import AMRPredictionModel
+from model import AMRPredictionModel
 
 N_CONTINUOUS_FEATURES = 3 
 
@@ -325,7 +325,6 @@ def forward_epoch(df, config, amr_prediction_model, criterion, optimizer, schedu
         start_time = time.time()
         token_ids, year, month, age, species_batch, sample_type_batch, x_resp, x_pos, y_resp, y_pos = to_device(batch, device)
         
-        # Create attention mask tensor
         attention_mask = torch.cat([
             torch.ones(token_ids.size(0), N_CONTINUOUS_FEATURES, device=device, dtype=torch.long),
             (token_ids != pad_id).long()
@@ -342,33 +341,33 @@ def forward_epoch(df, config, amr_prediction_model, criterion, optimizer, schedu
         batch_antibiotics = [antibiotics[int(i)] for i in ids_cpu]
 
         with torch.set_grad_enabled(train):
-
             output_logits = amr_prediction_model(token_ids, year, month, age, y_pos, attention_mask)
-            softmax_scores = torch.softmax(output_logits, dim=1)
+            output_logits_pos = output_logits[y_pos]
+            softmax_scores = torch.softmax(output_logits_pos, dim=1)
 
             if train:
-                loss, per_sample_losses, unreg_loss = _compute_loss(output_logits, targets, ids, criterion, train, config, antibiotics, species, device)
+                loss, per_sample_losses, unreg_loss = _compute_loss(output_logits_pos, targets, ids, criterion, train, config, antibiotics, species, device)
             else:
-                loss, per_sample_losses = _compute_loss(output_logits, targets, ids, criterion, train, config, antibiotics, species, device)
-            
-            # Backward pass and optimizer step
+                loss, per_sample_losses = _compute_loss(output_logits_pos, targets, ids, criterion, train, config, antibiotics, species, device)
+
             if train and loss is not None:
                 optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(amr_prediction_model.parameters(), 1.0)
                 optimizer.step()
-                scheduler.step()
+                if scheduler is not None:
+                    scheduler.step()
 
         if train:
             loss_val = loss.item() if loss is not None else float('nan')
             loss_unreg_val = unreg_loss.item() if unreg_loss is not None else float('nan')
-            acc = (torch.argmax(output_logits, dim=1) == targets).float().mean().item()
+            acc = (torch.argmax(output_logits_pos, dim=1) == targets).float().mean().item() if output_logits_pos.numel() > 0 else 0.0
             perform[0, batch_idx] = loss_val
             perform[1, batch_idx] = acc
             perform[2, batch_idx] = loss_unreg_val
         else:
             loss_val = loss.item() if loss is not None else float('nan')
-            acc = (torch.argmax(output_logits, dim=1) == targets).float().mean().item()
+            acc = (torch.argmax(output_logits_pos, dim=1) == targets).float().mean().item() if output_logits_pos.numel() > 0 else 0.0
             perform[0, batch_idx] = loss_val
             perform[1, batch_idx] = acc
 
@@ -377,7 +376,7 @@ def forward_epoch(df, config, amr_prediction_model, criterion, optimizer, schedu
         batch_losses_np = per_sample_losses.detach().cpu().numpy()
 
         if thresholds is None:
-            batch_preds_np = torch.argmax(output_logits, dim=1).detach().cpu().numpy()
+            batch_preds_np = torch.argmax(output_logits_pos, dim=1).detach().cpu().numpy()
         else:
             batch_preds_np = np.array([
                 1 if s >= thresholds.get((ab, sp, n_ast), 0.5) else 0
