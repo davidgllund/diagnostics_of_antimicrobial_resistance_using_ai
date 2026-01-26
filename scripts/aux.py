@@ -10,9 +10,9 @@ from collections import Counter
 from collections import defaultdict
 from torch.utils.data import Dataset
 
-def expand_samples(dataset, isolates_per_batch, n_metadata, seed, max_expansions=5, max_predictor_antibiotics=8):
+def expand_samples(dataset, config, isolates_per_batch, n_metadata, seed, max_expansions=5, max_predictor_antibiotics=8):
     if seed is None:
-        seed = random.randint(1, 10**18)
+        seed = random.randint(1, 10000)
 
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -26,11 +26,12 @@ def expand_samples(dataset, isolates_per_batch, n_metadata, seed, max_expansions
     for isolate in sampled['sentence']:
         metadata = isolate[:n_metadata]
         antibiotics = isolate[n_metadata:]
-        n_antibiotics = len(antibiotics)
+        antibiotic_classes = list(set([config['vocab']['ab_class'][x.split('_')[0]] for x in antibiotics]))
+        n_classes = len(antibiotic_classes)
 
-        possible_indices = list(range(n_antibiotics))
+        possible_indices = list(range(n_classes))
 
-        if n_antibiotics > max_expansions:
+        if n_classes > max_expansions:
             chosen_indices = np.random.choice(
                 possible_indices, size=max_expansions, replace=False
             )
@@ -38,12 +39,13 @@ def expand_samples(dataset, isolates_per_batch, n_metadata, seed, max_expansions
             chosen_indices = possible_indices
 
         for i in chosen_indices:
-            i_capped = min(i, max_predictor_antibiotics, n_antibiotics)
+            i_capped = min(i, max_predictor_antibiotics, n_classes)
 
             predictor_indices = np.sort(
-                np.random.choice(n_antibiotics, size=i_capped, replace=False)
+                np.random.choice(n_classes, size=i_capped, replace=False)
             )
-            selected_antibiotics = [antibiotics[j] for j in predictor_indices]
+            selected_classes = [antibiotic_classes[j] for j in predictor_indices]
+            selected_antibiotics = [x for x in antibiotics if config['vocab']['ab_class'][x.split('_')[0]] in selected_classes]
 
             predictors = ['<cls>', *metadata, *selected_antibiotics]
             predictor_set = set(predictors)
@@ -55,7 +57,7 @@ def expand_samples(dataset, isolates_per_batch, n_metadata, seed, max_expansions
 
             if i_capped == max_predictor_antibiotics:
                 break
-        
+
     return all_predictors, all_responses
 
 def get_balanced_indices(x, y, obs_per_epoch):
