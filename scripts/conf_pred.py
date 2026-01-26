@@ -80,8 +80,7 @@ def evaluate_model(df, config, amr_model, epoch_idx, device, vocab, thresholds=N
         batch_logits_np = classification_pred.detach().cpu().numpy()
         batch_softmax_np = softmax_scores.detach().cpu().numpy()
         batch_targets_np = targets.detach().cpu().numpy()
-
-        # Map numeric targets/preds to single-letter labels 'R' / 'S'
+ 
         if thresholds is None:
             batch_preds_num = torch.argmax(classification_pred, dim=1).detach().cpu().numpy()
         else:
