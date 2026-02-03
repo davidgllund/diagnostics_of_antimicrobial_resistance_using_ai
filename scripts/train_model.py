@@ -343,7 +343,6 @@ def forward_epoch(df, config, amr_prediction_model, criterion, optimizer, schedu
         batch_antibiotics = [antibiotics[int(i)] for i in ids_cpu]
 
         with torch.set_grad_enabled(train):
-
             output_logits = amr_prediction_model(token_ids, year, month, age, y_pos, attention_mask)
             softmax_scores = torch.softmax(output_logits, dim=1)
 
@@ -435,7 +434,7 @@ def forward_epoch(df, config, amr_prediction_model, criterion, optimizer, schedu
 
     if train is False and test is False:
         thresholds = compute_classification_thresholds(results_df)
-        with open('thresholds.pkl', "wb") as f:
+        with open('thresholds.pkl', 'wb') as f:
             pkl.dump(thresholds, f)
 
     return (perform, sum(batch_times), len(batch_times), class_metrics_df)
