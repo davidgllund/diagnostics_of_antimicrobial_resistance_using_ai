@@ -66,7 +66,9 @@ def load_previous_model(model_folder, amr_prediction_model, rank=0, load_previou
     if os.path.exists(model_path):
         try:
             log('Loading previous model weights...')
-            amr_prediction_model.load_state_dict(torch.load(model_path, weights_only=True))
+            map_loc = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
+            state_dict = torch.load(model_path, map_location=map_loc)
+            amr_prediction_model.load_state_dict(state_dict)
         except Exception as e:
             log(f'Warning: Failed to load model weights: {e}')
 
@@ -341,33 +343,32 @@ def forward_epoch(df, config, amr_prediction_model, criterion, optimizer, schedu
         batch_antibiotics = [antibiotics[int(i)] for i in ids_cpu]
 
         with torch.set_grad_enabled(train):
+
             output_logits = amr_prediction_model(token_ids, year, month, age, y_pos, attention_mask)
-            output_logits_pos = output_logits[y_pos]
-            softmax_scores = torch.softmax(output_logits_pos, dim=1)
+            softmax_scores = torch.softmax(output_logits, dim=1)
 
             if train:
-                loss, per_sample_losses, unreg_loss = _compute_loss(output_logits_pos, targets, ids, criterion, train, config, antibiotics, species, device)
+                loss, per_sample_losses, unreg_loss = _compute_loss(output_logits, targets, ids, criterion, train, config, antibiotics, species, device)
             else:
-                loss, per_sample_losses = _compute_loss(output_logits_pos, targets, ids, criterion, train, config, antibiotics, species, device)
-
+                loss, per_sample_losses = _compute_loss(output_logits, targets, ids, criterion, train, config, antibiotics, species, device)
+            
             if train and loss is not None:
                 optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(amr_prediction_model.parameters(), 1.0)
                 optimizer.step()
-                if scheduler is not None:
-                    scheduler.step()
+                scheduler.step()
 
         if train:
             loss_val = loss.item() if loss is not None else float('nan')
             loss_unreg_val = unreg_loss.item() if unreg_loss is not None else float('nan')
-            acc = (torch.argmax(output_logits_pos, dim=1) == targets).float().mean().item() if output_logits_pos.numel() > 0 else 0.0
+            acc = (torch.argmax(output_logits, dim=1) == targets).float().mean().item()
             perform[0, batch_idx] = loss_val
             perform[1, batch_idx] = acc
             perform[2, batch_idx] = loss_unreg_val
         else:
             loss_val = loss.item() if loss is not None else float('nan')
-            acc = (torch.argmax(output_logits_pos, dim=1) == targets).float().mean().item() if output_logits_pos.numel() > 0 else 0.0
+            acc = (torch.argmax(output_logits, dim=1) == targets).float().mean().item()
             perform[0, batch_idx] = loss_val
             perform[1, batch_idx] = acc
 
@@ -376,7 +377,7 @@ def forward_epoch(df, config, amr_prediction_model, criterion, optimizer, schedu
         batch_losses_np = per_sample_losses.detach().cpu().numpy()
 
         if thresholds is None:
-            batch_preds_np = torch.argmax(output_logits_pos, dim=1).detach().cpu().numpy()
+            batch_preds_np = torch.argmax(output_logits, dim=1).detach().cpu().numpy()
         else:
             batch_preds_np = np.array([
                 1 if s >= thresholds.get((ab, sp, n_ast), 0.5) else 0
@@ -482,7 +483,7 @@ def main():
     criterion, optimizer = start_optimizer_loss(config, amr_prediction_model, rank)
 
     n_epochs = config['train']['n_epochs']
-    train_loss, val_loss, start_epoch, avg_batch_time, total_time, processed_batches, min_val_loss = load_previous_state(
+    _, _, start_epoch, avg_batch_time, total_time, processed_batches, min_val_loss = load_previous_state(
         arguments.folder, n_epochs, rank
     )
 
@@ -497,12 +498,12 @@ def main():
 
     ema_batch_time = None
     obs_train = config['train']['obs_per_epoch']
-    obs_val   = config['test']['obs_per_epoch']
-    bs_train  = config['train']['batch_size']
-    bs_val    = config['test']['batch_size']
+    obs_val = config['test']['obs_per_epoch']
+    bs_train = config['train']['batch_size']
+    bs_val = config['test']['batch_size']
 
     train_batches_per_epoch = int(np.ceil(obs_train / bs_train))
-    val_batches_per_epoch   = int(np.ceil(obs_val   / bs_val))
+    val_batches_per_epoch = int(np.ceil(obs_val / bs_val))
 
     batches_per_epoch = train_batches_per_epoch + val_batches_per_epoch
     total_training_batches = n_epochs * batches_per_epoch
