@@ -344,13 +344,14 @@ def forward_epoch(df, config, amr_prediction_model, criterion, optimizer, schedu
 
         with torch.set_grad_enabled(train):
             output_logits = amr_prediction_model(token_ids, year, month, age, y_pos, attention_mask)
-            softmax_scores = torch.softmax(output_logits, dim=1)
+            output_logits_flat = output_logits[y_pos]
+            softmax_scores = torch.softmax(output_logits_flat, dim=1)
 
             if train:
-                loss, per_sample_losses, unreg_loss = _compute_loss(output_logits, targets, ids, criterion, train, config, antibiotics, species, device)
+                loss, per_sample_losses, unreg_loss = _compute_loss(output_logits_flat, targets, ids, criterion, train, config, antibiotics, species, device)
             else:
-                loss, per_sample_losses = _compute_loss(output_logits, targets, ids, criterion, train, config, antibiotics, species, device)
-            
+                loss, per_sample_losses = _compute_loss(output_logits_flat, targets, ids, criterion, train, config, antibiotics, species, device)
+
             if train and loss is not None:
                 optimizer.zero_grad()
                 loss.backward()
@@ -361,13 +362,13 @@ def forward_epoch(df, config, amr_prediction_model, criterion, optimizer, schedu
         if train:
             loss_val = loss.item() if loss is not None else float('nan')
             loss_unreg_val = unreg_loss.item() if unreg_loss is not None else float('nan')
-            acc = (torch.argmax(output_logits, dim=1) == targets).float().mean().item()
+            acc = (torch.argmax(output_logits_flat, dim=1) == targets).float().mean().item()
             perform[0, batch_idx] = loss_val
             perform[1, batch_idx] = acc
             perform[2, batch_idx] = loss_unreg_val
         else:
             loss_val = loss.item() if loss is not None else float('nan')
-            acc = (torch.argmax(output_logits, dim=1) == targets).float().mean().item()
+            acc = (torch.argmax(output_logits_flat, dim=1) == targets).float().mean().item()
             perform[0, batch_idx] = loss_val
             perform[1, batch_idx] = acc
 
@@ -376,7 +377,7 @@ def forward_epoch(df, config, amr_prediction_model, criterion, optimizer, schedu
         batch_losses_np = per_sample_losses.detach().cpu().numpy()
 
         if thresholds is None:
-            batch_preds_np = torch.argmax(output_logits, dim=1).detach().cpu().numpy()
+            batch_preds_np = torch.argmax(output_logits_flat, dim=1).detach().cpu().numpy()
         else:
             batch_preds_np = np.array([
                 1 if s >= thresholds.get((ab, sp, n_ast), 0.5) else 0
@@ -434,7 +435,7 @@ def forward_epoch(df, config, amr_prediction_model, criterion, optimizer, schedu
 
     if train is False and test is False:
         thresholds = compute_classification_thresholds(results_df)
-        with open('thresholds.pkl', 'wb') as f:
+        with open(model_cfg['thresholds'], 'wb') as f:
             pkl.dump(thresholds, f)
 
     return (perform, sum(batch_times), len(batch_times), class_metrics_df)
@@ -465,8 +466,8 @@ def main():
 
     df = pd.read_csv(config['data']['dataset'], sep='\t')
     df['sentence'] = [x.split(' ') for x in df['sentence']]
-    df_train = df.loc[~df['fold'].isin(['val', 'test'])]
-    df_val = df.loc[df['fold'].isin(['val'])]
+    df_train = df.loc[df['fold'].isin(['train'])]
+    df_val = df.loc[df['fold'].isin(['validation'])]
     df_test = df.loc[df['fold'].isin(['test'])]
 
     rank = 0
@@ -615,7 +616,7 @@ def main():
         print(f'Warning: Validation results file not found at {val_results_path}')
         val_results_df = None
 
-    thresholds_path = 'thresholds.pkl'
+    thresholds_path = config['model']['thresholds']
     if os.path.exists(thresholds_path):
         try:
             with open(thresholds_path, 'rb') as f:
