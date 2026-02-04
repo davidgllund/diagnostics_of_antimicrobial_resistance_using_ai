@@ -158,21 +158,6 @@ def evaluate_model(df, config, amr_model, epoch_idx, device, vocab, thresholds=N
     
     return perform, results_df
 
-def generate_conformal_set(softmax_prob, q_hat):
-    nonconf_pos = 1 - softmax_prob
-    nonconf_neg = softmax_prob
-    
-    if nonconf_pos <= q_hat and nonconf_neg > q_hat:
-        output = 'R'
-    elif nonconf_neg <= q_hat and nonconf_pos > q_hat:
-        output = 'S'
-    elif nonconf_pos <= q_hat and nonconf_neg <= q_hat:
-        output = 'R/S'
-    else:
-        output = ''
-        
-    return output
-
 def conf_pred(cal_results, eval_results): 
     confidences = [0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95]
     min_group_size = 20
@@ -267,17 +252,14 @@ def main():
 
     df = pd.read_csv(config['data']['dataset'], sep='\t')
     df['sentence'] = [x.split(' ') for x in df['sentence']]
-    df = df.loc[df['fold'].isin(['test'])]
-    df_shuffled = df.sample(frac=1, random_state=42).reset_index(drop=True)
-
-    df_cal = df_shuffled.iloc[:len(df_shuffled)//2]
-    df_eval = df_shuffled.iloc[len(df_shuffled)//2:]
+    df_cal = df.loc[df['fold'].isin(['calibration'])]
+    df_eval = df.loc[df['fold'].isin(['test'])]
 
     rank = 0
     print('Initializing model...')
     amr_model = create_model(config, pad_id, rank)
 
-    state = load_previous_model('model', amr_model, rank, load_previous=True)
+    _ = load_previous_model('model', amr_model, rank, load_previous=True)
 
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     amr_model.to(device)
