@@ -93,21 +93,6 @@ def format_data(df):
 
     return df_formatted
 
-def generate_balanced_labels(length, labels):
-    labels = list(labels)
-    n_labels = len(labels)
-
-    base_count = length // n_labels
-    remainder = length % n_labels
-
-    balanced = []
-    for i, label in enumerate(labels):
-        count = base_count + (1 if i < remainder else 0)
-        balanced.extend([label] * count)
-
-    random.shuffle(balanced)
-    return balanced
-
 def count_antibiotics(sentence, n_metadata):
     n_ab = len(sentence.split(' ')) - n_metadata
     return n_ab
@@ -122,8 +107,7 @@ def main():
     print('Formatting data')
     sentence = format_data(df)
 
-    labels = ['1', '2', '3', '4', '5', 'test', 'val']
-    fold = generate_balanced_labels(len(sentence), labels)
+    fold = np.random.choice(['train', 'validation', 'calibration', 'test'], size=len(sentence), p=[0.4, 0.1, 0.4, 0.1])
     n_ab = [count_antibiotics(x, 7) for x in sentence]
 
     df_formatted = pd.DataFrame({'sentence': sentence, 'n_ab': n_ab, 'fold': fold})
