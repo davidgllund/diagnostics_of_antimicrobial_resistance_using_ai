@@ -29,6 +29,7 @@ model:
   max_seq_len: 26
   n_antibiotics: 48
   n_outputs: 2
+  thresholds: 'thresholds.pkl'
 vocab:
   vocab: 'vocab_svebar.pth'
   types_ab: {'Penicillin': ['AMC','AMO','AMP','BEN','ISX','MEC','OXA','PHE','PIT', 'TEM'], 'Cephalosporin': ['CCL','CDR','CEF','CIX','CLE','CTA','CXI','CTI','CTR','CUR','CTT','CTV','CTZ'],'Fluoroquinolone': ['CIP','LEV','MOX','NOR','PEF'],'Aminoglycoside': ['AMI','GEN','TOB'],'Carbapenem': ['IMI','IMR','MER','ERT'],'Tetracycline': ['DOX','TET'],'Macrolide': ['AZI','ERY'], 'Sulfonamide': ['TRI','TRS'], 'Monobactam': ['AZT'], 'Fusidane': ['FUS'], 'Lincosamide': ['CLI'], 'Ansamycin': ['RIF'], 'Polymyxin': ['COL'], 'Glycopeptide': ['TEI'], 'Phosphonic acid': ['FOS']}
