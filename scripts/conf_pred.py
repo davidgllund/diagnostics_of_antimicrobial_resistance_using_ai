@@ -9,8 +9,10 @@ import torch
 import pickle as pkl
 
 from train_model import load_previous_model, create_model
-from aux import ABTextDataset, expand_samples, to_device
+from aux import ABTextDataset, expand_samples, get_balanced_indices, to_device
 from sys import argv
+
+N_CONTINUOUS_FEATURES = 3 
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(description='')
@@ -46,31 +48,35 @@ def compute_final_metrics(results_df):
         
     return pd.DataFrame(records)
 
-def evaluate_model(df, config, amr_model, epoch_idx, device, vocab, thresholds=None):
+def evaluate_model(df, config, amr_prediction_model, epoch_idx, device, vocab, thresholds=None):
     model_cfg = config['model']
     data_cfg = config['test']
 
     max_seq_len = model_cfg['max_seq_len']
     batch_size = data_cfg['batch_size']
     obs_per_epoch = data_cfg['obs_per_epoch']
-
+    isolates_per_batch = data_cfg['isolates_to_sample_per_batch']
     n_metadata = config['train']['n_metadata']
     pos_response = model_cfg['pos_response']
     antibiotics = [k.split('_')[0] for k in pos_response.keys()]
-    n_batches = int(obs_per_epoch / batch_size)
 
-    x, y = expand_samples(df, config, len(df), n_metadata, epoch_idx)
+    num_workers = min(4, os.cpu_count() or 1)
+    pin_memory = torch.cuda.is_available()
+    persistent_workers = num_workers > 0
 
-    idx = np.random.choice(range(len(x)), size=min(len(x), obs_per_epoch), replace=False)
+    x, y = expand_samples(df, config, isolates_per_batch, n_metadata, epoch_idx)
+    idx = get_balanced_indices(x, y, obs_per_epoch)
     x = [x[j] for j in idx]
     y = [y[j] for j in idx]
 
     dataset = ABTextDataset(x, y, vocab, antibiotics, max_seq_len, pos_response)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size, shuffle=False, num_workers=num_workers, 
+                                             pin_memory=pin_memory, persistent_workers=persistent_workers)
     
+    n_batches = int(np.ceil(min(len(dataset), obs_per_epoch) / batch_size))
     perform = torch.zeros(2, n_batches, dtype=torch.float32) - 1.0
 
-    amr_model.eval()
+    amr_prediction_model.eval()
 
     preds_list = []
     logits_list = []
@@ -85,49 +91,46 @@ def evaluate_model(df, config, amr_model, epoch_idx, device, vocab, thresholds=N
         token_ids, year, month, age, species_batch, sample_type_batch, x_resp, x_pos, y_resp, y_pos = to_device(batch, device)
  
         attention_mask = torch.cat([
-            torch.ones(token_ids.size(0), 3, device=device, dtype=torch.long),
+            torch.ones(token_ids.size(0), N_CONTINUOUS_FEATURES, device=device, dtype=torch.long),
             (token_ids != vocab.token_to_idx['<pad>']).long()
         ], dim=1)
+
+        ids = torch.nonzero(y_pos, as_tuple=False)[:, 1]
+        targets = y_resp[y_pos].to(device)
 
         batch_species = np.concatenate([np.repeat(species_batch[i], int(y_pos[i].sum())) for i in range(len(y_pos))]).tolist()
         batch_sample_type = np.concatenate([np.repeat(sample_type_batch[i], int(y_pos[i].sum())) for i in range(len(y_pos))]).tolist()
         batch_n_ast = np.concatenate([np.repeat(int(x_pos[i].sum().cpu().item()), int(y_pos[i].sum())) for i in range(len(y_pos))]).tolist()
 
-        with torch.set_grad_enabled(False):
-            amr_pred = amr_model(token_ids, year, month, age, y_pos, attention_mask)
-            classification_pred = amr_pred[y_pos]
-            softmax_scores = torch.softmax(classification_pred, dim=1)
-
-            ids = torch.nonzero(y_pos, as_tuple=False)[:, 1]
-            targets = y_resp[y_pos].to(device)
-
         ids_cpu = ids.cpu().numpy()
         batch_antibiotics = [antibiotics[int(i)] for i in ids_cpu]
 
-        batch_logits_np = classification_pred.detach().cpu().numpy()
+        with torch.set_grad_enabled(False):
+            output_logits = amr_prediction_model(token_ids, year, month, age, y_pos, attention_mask)
+            output_logits_flat = output_logits[y_pos]
+            softmax_scores = torch.softmax(output_logits_flat, dim=1)
+
+        batch_logits_np = output_logits_flat.detach().cpu().numpy()
         batch_softmax_np = softmax_scores.detach().cpu().numpy()
         batch_targets_np = targets.detach().cpu().numpy()
  
         if thresholds is None:
-            batch_preds_num = torch.argmax(classification_pred, dim=1).detach().cpu().numpy()
+            batch_preds_np = torch.argmax(output_logits_flat, dim=1).detach().cpu().numpy()
         else:
-            batch_preds_list = []
-            for s, ab, sp, n_ast in zip(batch_softmax_np[:, 1], batch_antibiotics, batch_species, batch_n_ast):
-                th = None
-                if isinstance(thresholds, dict):
-                    th = thresholds.get((ab, sp, n_ast))
-                    if th is None:
-                        th = thresholds.get(ab)
-                if th is None:
-                    th = 0.5
-                batch_preds_list.append(1 if s >= th else 0)
-            batch_preds_num = np.array(batch_preds_list)
+            batch_preds_np = np.array([
+                1 if s >= thresholds.get((ab, sp, n_ast), 0.5) else 0
+                for s, ab, sp, n_ast in zip(
+                    batch_softmax_np[:, 1], 
+                    batch_antibiotics, 
+                    batch_species, 
+                    batch_n_ast)
+            ])
 
-        batch_preds_np = np.array(['R' if p == 1 else 'S' for p in batch_preds_num])
+        batch_preds_str = np.array(['R' if p == 1 else 'S' for p in batch_preds_np])
         batch_targets_str = np.array(['R' if t == 1 else 'S' for t in batch_targets_np])
 
         logits_list.append(batch_logits_np)
-        preds_list.append(batch_preds_np)
+        preds_list.append(batch_preds_str)
         softmax_list.append(batch_softmax_np)
         trues_list.append(batch_targets_str)
         all_antibiotics.extend(batch_antibiotics)
@@ -154,13 +157,13 @@ def evaluate_model(df, config, amr_model, epoch_idx, device, vocab, thresholds=N
         'softmax': softmaxes[:, 1]
     })
     
-    del token_ids, x_resp, x_pos, y_resp, y_pos, targets, amr_pred, classification_pred, x, y, dataset, dataloader
+    del token_ids, x_resp, x_pos, y_resp, y_pos, targets, output_logits, output_logits_flat, x, y, dataset, dataloader
     
     return perform, results_df
 
 def conf_pred(cal_results, eval_results): 
     confidences = [0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95]
-    min_group_size = 20
+    min_group_size = 100
 
     cal_results = cal_results.copy()
     cal_results['nonconf_R'] = 1.0 - cal_results['softmax']
@@ -170,25 +173,6 @@ def conf_pred(cal_results, eval_results):
 
     for confidence in confidences:
         alpha = 1 - confidence
-
-        all_nonconfs = np.sort(np.concatenate([cal_results['nonconf_R'].values, cal_results['nonconf_S'].values]))
-        n_all = len(all_nonconfs)
-        if n_all == 0:
-            raise ValueError('No calibration samples available to compute global q_hat')
-        k_all = int(np.ceil((n_all + 1) * (1 - alpha)))
-        k_all = min(max(k_all, 1), n_all)
-        global_q_hat = float(all_nonconfs[k_all - 1])
-
-        label_q_hats = {}
-        for lbl, col in [('R', 'nonconf_R'), ('S', 'nonconf_S')]:
-            vals_lbl = np.sort(cal_results.loc[cal_results['true'] == lbl, col].values)
-            n_lbl = len(vals_lbl)
-            if n_lbl >= min_group_size:
-                k_lbl = int(np.ceil((n_lbl + 1) * (1 - alpha)))
-                k_lbl = min(max(k_lbl, 1), n_lbl)
-                label_q_hats[lbl] = float(vals_lbl[k_lbl - 1])
-            else:
-                label_q_hats[lbl] = None
 
         q_hats = {}
         grouped = cal_results.groupby('antibiotic')
@@ -213,12 +197,13 @@ def conf_pred(cal_results, eval_results):
             nonconf_S = pR
 
             qR = q_hats.get((abx, 'R'))
-            if qR is None:
-                qR = label_q_hats.get('R') if label_q_hats.get('R') is not None else global_q_hat
-
             qS = q_hats.get((abx, 'S'))
-            if qS is None:
-                qS = label_q_hats.get('S') if label_q_hats.get('S') is not None else global_q_hat
+
+            # Skip conformal prediction if either q_hat is unavailable (insufficient calibration samples)
+            if qR is None or qS is None:
+                conformal_sets.append('')
+                q_used.append((None, None))
+                continue
 
             include_R = nonconf_R <= qR
             include_S = nonconf_S <= qS
@@ -264,7 +249,7 @@ def main():
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     amr_model.to(device)
 
-    with open('thresholds.pkl', 'rb') as f:
+    with open(config['model']['thresholds'], 'rb') as f:
         thresholds = pkl.load(f)
 
     _, cal_results_df = evaluate_model(df_cal, config, amr_model, 1000, device, vocab, thresholds=None)
