@@ -175,29 +175,30 @@ def conf_pred(cal_results, eval_results):
         alpha = 1 - confidence
 
         q_hats = {}
-        grouped = cal_results.groupby('antibiotic')
-        for abx, g in grouped:
+        grouped = cal_results.groupby(['antibiotic', 'species'])
+        for (abx, sp), g in grouped:
             for lbl, col in [('R', 'nonconf_R'), ('S', 'nonconf_S')]:
                 vals = np.sort(g.loc[g['true'] == lbl, col].values)
                 n = len(vals)
                 if n >= min_group_size:
                     k = int(np.ceil((n + 1) * (1 - alpha)))
                     k = min(max(k, 1), n)
-                    q_hats[(abx, lbl)] = float(vals[k - 1])
+                    q_hats[(abx, sp, lbl)] = float(vals[k - 1])
                 else:
-                    q_hats[(abx, lbl)] = None
+                    q_hats[(abx, sp, lbl)] = None
 
         conformal_sets = []
         q_used = []
         for _, row in results_out.iterrows():
             abx = row['antibiotic']
+            sp = row['species']
             pR = row['softmax']
             
             nonconf_R = 1.0 - pR
             nonconf_S = pR
 
-            qR = q_hats.get((abx, 'R'))
-            qS = q_hats.get((abx, 'S'))
+            qR = q_hats.get((abx, sp, 'R'))
+            qS = q_hats.get((abx, sp, 'S'))
 
             # Skip conformal prediction if either q_hat is unavailable (insufficient calibration samples)
             if qR is None or qS is None:
