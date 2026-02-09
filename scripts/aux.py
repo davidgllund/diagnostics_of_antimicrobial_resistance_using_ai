@@ -47,10 +47,15 @@ def expand_samples(dataset, config, isolates_per_batch, n_metadata, seed, max_ex
             selected_classes = [antibiotic_classes[j] for j in predictor_indices]
             selected_antibiotics = [x for x in antibiotics if config['vocab']['ab_class'][x.split('_')[0]] in selected_classes]
 
-            predictors = ['<cls>', *metadata, *selected_antibiotics]
-            predictor_set = set(predictors)
-
+            predictor_set = set(selected_antibiotics)
             response = [abx for abx in antibiotics if abx not in predictor_set]
+
+            if len(selected_antibiotics) > max_predictor_antibiotics:
+                selected_antibiotics = np.random.choice(
+                    selected_antibiotics, size=max_predictor_antibiotics, replace=False
+                ).tolist()
+
+            predictors = ['<cls>', *metadata, *selected_antibiotics]
 
             all_predictors.append(predictors)
             all_responses.append(response)
