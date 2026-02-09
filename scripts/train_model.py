@@ -278,7 +278,6 @@ def compute_final_metrics(results_df):
 
 
 def forward_epoch(df, config, amr_prediction_model, criterion, optimizer, scheduler, epoch_idx, device, vocab, pad_id, train=True, test=False, thresholds=None):
-
     model_cfg = config['model']
     data_cfg = config['train'] if train else config['test']
 
