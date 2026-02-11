@@ -245,7 +245,7 @@ def main():
     print('Initializing model...')
     amr_model = create_model(config, pad_id, rank)
 
-    _ = load_previous_model('model', amr_model, rank, load_previous=True)
+    _ = load_previous_model(arguments.folder, amr_model, rank, load_previous=True)
 
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     amr_model.to(device)
