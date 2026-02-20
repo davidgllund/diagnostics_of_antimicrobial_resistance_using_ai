@@ -6,11 +6,28 @@ import random
 import os
 import time
 
-from collections import Counter
-from collections import defaultdict
+from collections import defaultdict, Counter
 from torch.utils.data import Dataset
 
-def expand_samples(dataset, config, isolates_per_batch, n_metadata, seed, max_expansions=5, max_predictor_antibiotics=8):
+def separate_duplicate_class(items, classes):
+    counts = Counter(classes)
+
+    class_indices = defaultdict(list)
+    for idx, cls in enumerate(classes):
+        if counts[cls] > 1:
+            class_indices[cls].append(idx)
+
+    selected_indices = {
+        random.choice(indices)
+        for indices in class_indices.values()
+    }
+
+    extracted = [items[i] for i in selected_indices]
+    remaining = [item for i, item in enumerate(items) if i not in selected_indices]
+    
+    return extracted, remaining
+
+def expand_samples(dataset, config, isolates_per_batch, n_metadata, seed, max_expansions=5, max_predictor_antibiotics=6):
     if seed is None:
         seed = random.randint(1, 10000)
 
@@ -44,11 +61,23 @@ def expand_samples(dataset, config, isolates_per_batch, n_metadata, seed, max_ex
             predictor_indices = np.sort(
                 np.random.choice(n_classes, size=i_capped, replace=False)
             )
+            
             selected_classes = [antibiotic_classes[j] for j in predictor_indices]
             selected_antibiotics = [x for x in antibiotics if config['vocab']['ab_class'][x.split('_')[0]] in selected_classes]
+            selected_antibiotics = list(set(selected_antibiotics))
 
-            predictor_set = set(selected_antibiotics)
-            response = [abx for abx in antibiotics if abx not in predictor_set]
+            chance = random.randrange(1,100)
+            if chance <= 25:
+                predictor_set = set(selected_antibiotics)
+                response = [abx for abx in antibiotics if abx not in predictor_set]
+
+                extracted, remaining = separate_duplicate_class(response, [config['vocab']['ab_class'][x.split('_')[0]] for x in response])
+                selected_antibiotics = [*selected_antibiotics, *extracted]
+                response = remaining
+
+            else:
+                predictor_set = set(selected_antibiotics)
+                response = [abx for abx in antibiotics if abx not in predictor_set]
 
             if len(selected_antibiotics) > max_predictor_antibiotics:
                 selected_antibiotics = np.random.choice(
