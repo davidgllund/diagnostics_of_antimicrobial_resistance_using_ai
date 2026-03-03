@@ -66,18 +66,14 @@ def expand_samples(dataset, config, isolates_per_batch, n_metadata, seed, max_ex
             selected_antibiotics = [x for x in antibiotics if config['vocab']['ab_class'][x.split('_')[0]] in selected_classes]
             selected_antibiotics = list(set(selected_antibiotics))
 
+            predictor_set = set(selected_antibiotics)
+            response = [abx for abx in antibiotics if abx not in predictor_set]
+            
             chance = random.randrange(1,100)
             if chance <= 25:
-                predictor_set = set(selected_antibiotics)
-                response = [abx for abx in antibiotics if abx not in predictor_set]
-
                 extracted, remaining = separate_duplicate_class(response, [config['vocab']['ab_class'][x.split('_')[0]] for x in response])
                 selected_antibiotics = [*selected_antibiotics, *extracted]
                 response = remaining
-
-            else:
-                predictor_set = set(selected_antibiotics)
-                response = [abx for abx in antibiotics if abx not in predictor_set]
 
             if len(selected_antibiotics) > max_predictor_antibiotics:
                 selected_antibiotics = np.random.choice(
