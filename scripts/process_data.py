@@ -14,12 +14,6 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(description='Format input data and generate vocabulary file.')
     parser.add_argument('--input', '-i', required=True,
                         help='Input data file.')
-    parser.add_argument('--ab_abbrev', required=True,
-                        help='File containing antibiotic abrreviations.')
-    parser.add_argument('--sp_abbrev', required=True,
-                        help='File containing bacterial species abrreviations.')
-    parser.add_argument('--sample_categ', required=True,
-                        help='File containing types of sample and their respective categories.')
     parser.add_argument('--output', '-o', required=True,
                         help='Name of output data file.')
     parser.add_argument('--vocab', required=True,
@@ -28,33 +22,6 @@ def parse_args(argv):
     arguments = parser.parse_args()
     
     return arguments
-
-def read_dict(filename):
-    dictionary = {}
-    with open(filename, 'r') as f:
-        for line in f:
-            items = line.split('\t')
-            dictionary[items[0]] = items[1].strip()      
-    return dictionary
-
-def preprocess_data(df, ab_abbrev, sp_abbrev, sample_categ): 
-    ab_dict = read_dict(ab_abbrev)
-    sp_dict = read_dict(sp_abbrev)
-    sample_dict = read_dict(sample_categ)
-
-    df['antibiotic_short'] = [ab_dict[x] if x in ab_dict.keys() else x for x in df['antibiotikum_namn']]
-    df['species_short'] = [sp_dict[x] if x in sp_dict.keys() else x for x in df['smittamne_namn']]
-    df['sample'] = [sample_dict[x] if x in sample_dict.keys() else x for x in df['provmaterial_namn']]
-
-    df['provtagnings_datum'] = pd.to_datetime(df['provtagnings_datum'], errors='coerce')
-
-    df['year'] = df['provtagnings_datum'].dt.year.astype(str)
-    df['month'] = df['provtagnings_datum'].dt.month.astype(str)
-
-    df['patient_alder'] = [x.split('.')[0] for x in df['patient_alder'].astype(str)]
-    df['patient_kon'] = df['patient_kon'].astype(str)
-
-    return df
 
 def format_ast(lst):
     uniq_items = lst.unique()
@@ -80,12 +47,13 @@ def format_data(df):
     tqdm.pandas()
 
     df_formatted = (
-        df.groupby('id')
+        df.groupby(['LabID', 'IsolateID'])
         .progress_apply(
             lambda g: ' '.join(
-                [g['year'].iloc[0], g['month'].iloc[0], g['patient_alder'].iloc[0], 
-                 g['labb_kod'].iloc[0], g['patient_kon'].iloc[0], g['species_short'].iloc[0], 
-                 g['sample'].iloc[0], *format_ast(g['antibiotic_short'] + '_' + g['sir'])]
+                map(str, [g['Year'].iloc[0], g['Month'].iloc[0], g['Age'].iloc[0],
+                    g['LabID'].iloc[0], g['Gender'].iloc[0], g['Pathogen'].iloc[0], 
+                    g['Specimen'].iloc[0], *format_ast(g['Antibiotic'] + '_' + g['SIR'])
+                ])
             )
         )
         .tolist()
@@ -101,11 +69,12 @@ def main():
     arguments = parse_args(argv)
     data = pd.read_csv(arguments.input, sep='\t')
 
-    print('Preprocessing data')
-    df = preprocess_data(data, arguments.ab_abbrev, arguments.sp_abbrev, arguments.sample_categ)
+    data['Date'] = pd.to_datetime(data['Date'], errors='coerce')
+    data['Year'] = data['Date'].dt.year.astype(str)
+    data['Month'] = data['Date'].dt.month.astype(str)
 
     print('Formatting data')
-    sentence = format_data(df)
+    sentence = format_data(data)
 
     fold = np.random.choice(['train', 'validation', 'calibration', 'test'], size=len(sentence), p=[0.4, 0.1, 0.4, 0.1])
     n_ab = [count_antibiotics(x, 7) for x in sentence]
