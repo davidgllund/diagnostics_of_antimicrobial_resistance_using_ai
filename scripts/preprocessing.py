@@ -80,20 +80,19 @@ def format_dataset(df, antibiotic_map, species_map, sample_map):
 
     df['provtagnings_datum'] = df['provtagnings_datum'].dt.strftime("%Y-%m-%d")
     df['antibiotikum_namn'] = df['antibiotikum_namn'].str.replace(r"\s*\(.*\)", "", regex=True)
-    df['Antibiotic'] = df['antibiotikum_namn'].map(antibiotic_map)
-    df['Pathogen'] = df['smittamne_namn'].map(species_map)
-    df['Specimen'] = df['provmaterial_namn'].map(sample_map) 
+    df['antibiotic'] = df['antibiotikum_namn'].map(antibiotic_map)
+    df['pathogen'] = df['smittamne_namn'].map(species_map)
+    df['specimen'] = df['provmaterial_namn'].map(sample_map) 
 
     df = df.rename(columns={
-        'provtagnings_datum': 'Date',
-        'labb_kod': 'LabID',
-        'patient_kon': 'Gender',
-        'patient_alder': 'Age',
-        'id': 'IsolateID',
-        'sir': 'SIR'
+        'provtagnings_datum': 'date',
+        'labb_kod': 'lab_id',
+        'patient_kon': 'gender',
+        'patient_alder': 'age',
+        'id': 'isolate_id'
     })[
-        ['Date', 'LabID', 'Specimen', 'Gender', 'Age', 
-         'IsolateID', 'Pathogen', 'Antibiotic', 'SIR']
+        ['date', 'lab_id', 'specimen', 'gender', 'age', 
+         'isolate_id', 'pathogen', 'antibiotic', 'sir']
     ]
 
     return df
@@ -103,27 +102,27 @@ def filter_ab_sp_combinations(df):
     
     # Extract species  with sufficient data
     top_sp = (
-        df[['LabID', 'IsolateID', 'Pathogen']]
+        df[['lab_id', 'isolate_id', 'pathogen']]
         .drop_duplicates()
-        .groupby('Pathogen')
+        .groupby('pathogen')
         .size()
         .reset_index(name='Freq')
     )
 
     top_sp = top_sp[top_sp['Freq'] > 10000]
-    df = df.loc[df['Pathogen'].isin(top_sp['Pathogen'])]
+    df = df.loc[df['pathogen'].isin(top_sp['pathogen'])]
 
     # Extract antibiotic-species combinations with sufficient data
     ab_keep_df = (
         df
-        .assign(isS = df['SIR'] == 'S')
-        .assign(isI = df['SIR'] == 'I')
-        .assign(isR = df['SIR'] == 'R')
-        .groupby(['Pathogen', 'Antibiotic'])
+        .assign(isS = df['sir'] == 'S')
+        .assign(isI = df['sir'] == 'I')
+        .assign(isR = df['sir'] == 'R')
+        .groupby(['pathogen', 'antibiotic'])
         .agg(I_rate=('isI', 'mean'),
             S_rate=('isS', 'mean'), 
             R_rate=('isR', 'mean'), 
-            n=('SIR', 'size'))
+            n=('sir', 'size'))
         .reset_index()
     )
 
@@ -134,17 +133,17 @@ def filter_ab_sp_combinations(df):
     ]
 
     df = df.merge(
-        ab_keep_df[['Pathogen', 'Antibiotic']],
-        on=['Pathogen', 'Antibiotic'],
+        ab_keep_df[['pathogen', 'antibiotic']],
+        on=['pathogen', 'antibiotic'],
         how='inner'
     )
 
     # In relevant cases, keep tests where the result is "I"
     tmp = ab_keep_df[ab_keep_df['I_rate'] >= 0.05]
-    valid_i_pairs = set(zip(tmp['Pathogen'], tmp['Antibiotic']))
+    valid_i_pairs = set(zip(tmp['pathogen'], tmp['antibiotic']))
     df = df[
-        ~((df['SIR'] == 'I') & 
-        (~df[['Pathogen', 'Antibiotic']].apply(tuple, axis=1).isin(valid_i_pairs)))
+        ~((df['sir'] == 'I') & 
+        (~df[['pathogen', 'antibiotic']].apply(tuple, axis=1).isin(valid_i_pairs)))
     ]
 
     return df

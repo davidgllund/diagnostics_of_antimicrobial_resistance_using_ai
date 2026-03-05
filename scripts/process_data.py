@@ -47,12 +47,12 @@ def format_data(df):
     tqdm.pandas()
 
     df_formatted = (
-        df.groupby(['LabID', 'IsolateID'])
+        df.groupby(['lab_id', 'isolate_id'])
         .progress_apply(
             lambda g: ' '.join(
-                map(str, [g['Year'].iloc[0], g['Month'].iloc[0], g['Age'].iloc[0],
-                    g['LabID'].iloc[0], g['Gender'].iloc[0], g['Pathogen'].iloc[0], 
-                    g['Specimen'].iloc[0], *format_ast(g['Antibiotic'] + '_' + g['SIR'])
+                map(str, [g['year'].iloc[0], g['month'].iloc[0], g['age'].iloc[0],
+                    g['lab_id'].iloc[0], g['gender'].iloc[0], g['pathogen'].iloc[0], 
+                    g['specimen'].iloc[0], *format_ast(g['antibiotic'] + '_' + g['sir'])
                 ])
             )
         )
@@ -69,9 +69,9 @@ def main():
     arguments = parse_args(argv)
     data = pd.read_csv(arguments.input, sep='\t')
 
-    data['Date'] = pd.to_datetime(data['Date'], errors='coerce')
-    data['Year'] = data['Date'].dt.year.astype(str)
-    data['Month'] = data['Date'].dt.month.astype(str)
+    data['date'] = pd.to_datetime(data['date'], errors='coerce')
+    data['year'] = data['date'].dt.year.astype(str)
+    data['month'] = data['date'].dt.month.astype(str)
 
     print('Formatting data')
     sentence = format_data(data)
