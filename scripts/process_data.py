@@ -1,10 +1,9 @@
 #!/usr/bin/env python
 import argparse
 import torch
-import pandas as pd
-import random
+import pandas as pd 
 import numpy as np
-from collections import Counter
+from collections import defaultdict
 from tqdm import tqdm
 from sys import argv
 
@@ -26,22 +25,23 @@ def parse_args(argv):
 def format_ast(lst):
     uniq_items = lst.unique()
 
-    ab = [x.split('_')[0] for x in uniq_items]
-    result = [x.split('_')[1] for x in uniq_items]
+    grouped = defaultdict(list)
+    for item in uniq_items:
+            ab, res = item.split('_')
+            grouped[ab].append(res)
 
-    if len(set(ab)) == len(uniq_items):
-        return list(uniq_items)
-    
-    else:
-        inconclusive_ab = list({k: v for k, v in Counter(ab).items() if v != 1}.keys())
-        index = [i for i, e in enumerate(ab) if e in inconclusive_ab]
-        
-        for idx in index:
-            result[idx] = 'R'
+    output = []
+    for ab, results in grouped.items():
+            if 'R' in results:
+                final = 'R'
+            elif 'I' in results:
+                final = 'I'
+            else:
+                final = 'S'
 
-        output = list(set(['_'.join([x, y]) for x, y in zip(ab, result)]))
+            output.append(f"{ab}_{final}")
 
-        return output
+    return output
 
 def format_data(df):
     tqdm.pandas()
