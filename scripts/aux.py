@@ -162,19 +162,34 @@ def print_progress(epoch, step_in_epoch, batches_per_epoch,
         end=""
     )
 
+def numeric_to_phenotype(y_numeric, n_classes):
+    if n_classes == 2:
+        phenotype_map = {0: 'S', 1: 'R'}
+    else:
+        phenotype_map = {0: 'S', 1: 'I', 2: 'R'}
+    
+    return np.array([phenotype_map[int(y)] for y in y_numeric])
+
 class ABTextDataset(Dataset):
     """
     Custom Dataset for predictor-response sequences for antibiotic prediction.
     """
-    def __init__(self, X, Y, vocab, antibiotics, max_seq_len, pos_response):
+    def __init__(self, X, Y, vocab, antibiotics, max_seq_len, encode_response):
         self.vocab = vocab
         self.df = pd.DataFrame({'x': X, 'y': Y})
-        self.ab = antibiotics
+        self.antibiotics = antibiotics
         self.max_seq_len = max_seq_len
-        self.pos_response = pos_response
-        self.pos_response_list  = list(pos_response.keys())
+        self.encode_response = encode_response
+        self.encode_response_list  = list(encode_response.keys())
         self.species = [x[6] for x in X]
         self.sample_type = [x[7] for x in X]
+
+        self.response_to_ab_idx = {}
+        for response_key in self.encode_response_list:
+            ab_name = response_key.split('_')[0]
+            if ab_name in self.antibiotics:
+                ab_idx = self.antibiotics.index(ab_name)
+                self.response_to_ab_idx[response_key] = ab_idx
 
     def __len__(self):
         """Number of samples in the dataset."""
@@ -195,18 +210,29 @@ class ABTextDataset(Dataset):
         month = torch.tensor([int(token_x[2])], dtype=torch.float32)
         age = torch.tensor([int(token_x[3])], dtype=torch.float32)
 
-        del token_x[1:4]
-    
-        p_x = [t.split('_')[0] for t in token_x if t.split('_')[0] in self.ab]
-        x_pos = torch.tensor([t in p_x for t in self.ab], dtype=bool)
+        del token_x[1:4] 
 
- 
-        x_resp = torch.tensor([1 if t in token_x else 0 for t in self.pos_response_list], dtype=torch.int64)
+        x_resp = torch.zeros(len(self.antibiotics), dtype=torch.long)
+        x_pos = torch.zeros(len(self.antibiotics), dtype=torch.long)
+        
+        for ast in token_x:
+            if ast in self.encode_response:
+                ab_name = ast.split('_')[0]
+                if ab_name in self.antibiotics:
+                    ab_idx = self.antibiotics.index(ab_name) 
+                    x_resp[ab_idx] = self.encode_response[ast]
+                    x_pos[ab_idx] = 1
 
-        p_y = [t.split('_')[0] for t in token_y if t.split('_')[0] in self.ab]
-        y_pos = torch.tensor([t in p_y for t in self.ab], dtype=bool)
-
-        y_resp = torch.tensor([1 if t in token_y else 0 for t in self.pos_response_list], dtype=torch.int64)
+        y_resp = torch.zeros(len(self.antibiotics), dtype=torch.long)
+        y_pos = torch.zeros(len(self.antibiotics), dtype=torch.long)
+        
+        for ast in token_y:
+            if ast in self.encode_response:
+                ab_name = ast.split('_')[0]
+                if ab_name in self.antibiotics:
+                    ab_idx = self.antibiotics.index(ab_name) 
+                    y_resp[ab_idx] = self.encode_response[ast]
+                    y_pos[ab_idx] = 1
 
         token_x = token_x + ['<pad>'] * (self.max_seq_len - len(token_x))
         token_x = torch.tensor(self.vocab[token_x], dtype=torch.int64)

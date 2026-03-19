@@ -135,8 +135,9 @@ class AMRPredictionModel(nn.Module):
     Antibiotic prediction model using HuggingFace transformers encoder.
     Maintains same interface as original ABPred but with transformer-based backend.
     """
-    def __init__(self, embedding_size, n_antibiotics, n_outputs, layer_norm_eps, n_heads, encoder_stack_depth, 
-                 ffn_dimension, max_seq_len, vocab_size, pad_id, dropout_rate_attn, **kwargs):
+    def __init__(self, embedding_size, n_antibiotics, antibiotics, layer_norm_eps, n_heads, encoder_stack_depth, 
+                 ffn_dimension, max_seq_len, vocab_size, pad_id, dropout_rate_attn,
+                 n_outputs_per_antibiotic=None, **kwargs):
         """
         Initialize ABPred model.
         
@@ -153,6 +154,10 @@ class AMRPredictionModel(nn.Module):
             pad_id: Padding token ID
             dropout_rate_attn: Attention dropout rate
             dropout_rate_pwff: Deprecated - kept for compatibility, not used (HuggingFace uses unified dropout)
+            n_outputs_per_antibiotic: List/dict specifying output classes per antibiotic.
+                                     If None, all use n_outputs (default behavior).
+                                     If list: [2, 3, 2, ...] for each antibiotic
+                                     If dict: {'AMC': 2, 'AMI': 3, ...}
         """
         super().__init__(**kwargs)
         
@@ -168,47 +173,25 @@ class AMRPredictionModel(nn.Module):
             dropout_rate_attn=dropout_rate_attn,
             layer_norm_eps=layer_norm_eps
         )
-        
-        # One classifier per antibiotic
-        self.classifiers = nn.ModuleList([
-            AntibioticClassifier(embedding_size, n_outputs, layer_norm_eps) 
-            for _ in range(n_antibiotics)
-        ])
-        
+
         self.n_antibiotics = n_antibiotics
+        self.n_outputs_list = [n_outputs_per_antibiotic[ab] for ab in antibiotics]
+        
+        # Create classifiers with variable output sizes
+        self.classifiers = nn.ModuleList([
+            AntibioticClassifier(embedding_size, n_out, layer_norm_eps)
+            for n_out in self.n_outputs_list
+        ])
     
-    def forward(self, token_ids, year, month, age, positions_y, attention_mask):
-        """
-        Forward pass through the model.
-        
-        Args:
-            token_ids: Token indices [batch_size, seq_len]
-            year: Year values [batch_size, 1]
-            month: Month values [batch_size, 1]
-            age: Age values [batch_size, 1]
-            positions_y: Boolean tensor indicating which antibiotics to predict [batch_size, n_antibiotics]
-            attention_mask: Mask for <pad>
-            
-        Returns:
-            Predictions for requested antibiotics [n_positive_positions, n_outputs]
-        """
-        # Encode input
-        encoded_representations = self.encoder(token_ids, year, month, age, attention_mask)
-        
-        # Get [CLS] token representation
-        cls_representation = encoded_representations[:, 3:4, :]
-        
-        # Run all classifiers
-        all_logits = []
+    def forward(self, token_ids, year, month, age, attention_mask):
+        encoded = self.encoder(token_ids, year, month, age, attention_mask)
+        cls_representation = encoded[:, 3, :] 
+
+        logits_list = []
+
         for classifier in self.classifiers:
-            antibiotic_logits = classifier(cls_representation)
-            all_logits.append(antibiotic_logits)
-        
-        # Concatenate all predictions
-        all_antibiotic_logits = torch.cat(all_logits, dim=1)
-        
-        # Select only the requested positions
-        output_logits = all_antibiotic_logits * positions_y.unsqueeze(-1)
-        
-        return output_logits
+            logits = classifier(cls_representation)
+            logits_list.append(logits)
+
+        return logits_list
     

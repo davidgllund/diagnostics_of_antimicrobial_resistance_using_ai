@@ -11,11 +11,11 @@ import numpy as np
 import pandas as pd
 import random
 import gc
+import sys
 
 from transformers import get_linear_schedule_with_warmup
-from sklearn.metrics import roc_curve
-import sys
-from aux import ABTextDataset, expand_samples, get_balanced_indices, to_device, append_df_to_tsv, update_ema, print_progress
+#from sklearn.metrics import roc_curve
+from aux import ABTextDataset, expand_samples, get_balanced_indices, to_device, append_df_to_tsv, update_ema, print_progress, numeric_to_phenotype
 from model import AMRPredictionModel
 
 N_CONTINUOUS_FEATURES = 3 
@@ -34,7 +34,7 @@ def create_model(config, pad_id, rank=0):
     amr_prediction_model = AMRPredictionModel(
         embedding_size=model_cfg['embedding_size'],
         n_antibiotics=model_cfg['n_antibiotics'],
-        n_outputs=model_cfg['n_outputs'],
+        antibiotics=list(dict.fromkeys(k.split('_')[0] for k in model_cfg['encode_response'])),
         layer_norm_eps=model_cfg['layer_norm_eps'],
         n_heads=model_cfg['n_heads'],
         encoder_stack_depth=model_cfg['encoder_stack_depth'],
@@ -42,7 +42,8 @@ def create_model(config, pad_id, rank=0):
         max_seq_len=model_cfg['max_seq_len'],
         vocab_size=vocab_cfg['vocab_size'],
         pad_id=pad_id,
-        dropout_rate_attn=model_cfg['dropout_rate_attn']
+        dropout_rate_attn=model_cfg['dropout_rate_attn'],
+        n_outputs_per_antibiotic=model_cfg['n_outputs_per_antibiotic']
     )
     print(f'Model parameters: {sum(p.numel() for p in amr_prediction_model.parameters() if p.requires_grad):,}')
     return amr_prediction_model
@@ -141,15 +142,19 @@ def start_optimizer_loss(config, amr_prediction_model, rank=0):
 
     model_cfg = config['model']
     train_cfg = config['train']
+    encode_response = model_cfg['encode_response']
 
-    antibiotics = [key.split('_')[0] for key in model_cfg['pos_response'].keys()]
+    antibiotics = list(dict.fromkeys(k.split('_')[0] for k in encode_response))
 
-    criterion = [nn.CrossEntropyLoss(reduction='none') for _ in antibiotics]
+    criterion = {}
+    for ab in antibiotics:
+        criterion[ab] = nn.CrossEntropyLoss(reduction='none')
+
     optimizer = optim.Adam(params=amr_prediction_model.parameters(), lr=train_cfg['learning_rate'])
     
     return criterion, optimizer
 
-def _apply_regularization(classification_pred, ids, words, classes, lambda_reg, device):
+def _apply_regularization(logits, antibiotic_indices, words, classes, lambda_reg, device):
     wrd_to_class = [classes.get(wrd, 'unknown') for wrd in words]
 
     class_to_idxs = {}
@@ -161,8 +166,8 @@ def _apply_regularization(classification_pred, ids, words, classes, lambda_reg, 
         if len(idxs) < 2:
             continue
 
-        mask_cls = torch.isin(ids, torch.tensor(idxs, device=device))
-        class_logits = classification_pred[mask_cls]
+        mask_cls = torch.isin(antibiotic_indices, torch.tensor(idxs, device=device))
+        class_logits = logits[mask_cls]
         if class_logits.size(0) > 0:
             class_means[cls] = class_logits.mean(dim=0)
 
@@ -172,112 +177,154 @@ def _apply_regularization(classification_pred, ids, words, classes, lambda_reg, 
             continue
 
         for i in idxs:
-            wrd_mask = (ids == i)
+            wrd_mask = (antibiotic_indices == i)
             if wrd_mask.sum() == 0:
                 continue
 
-            wrd_logits = classification_pred[wrd_mask]
+            wrd_logits = logits[wrd_mask]
             reg_loss += ((wrd_logits - class_means[cls]) ** 2).mean()
 
     reg_loss = lambda_reg * reg_loss
     return reg_loss
 
-def _compute_loss(output_logits, targets, ids, criterion, train, config, antibiotics, species, device):
-    n_samples = targets.size(0)
-    per_sample_losses = torch.zeros((n_samples,), dtype=torch.float32, device=device)
+def _compute_loss(logits_list, y_pos, y_resp, criterion, train, config, antibiotics, species, device):
+    loss_total = torch.tensor(0.0, device=device)
+    n_total = 0
+    per_sample_losses = []
 
-    weighted_losses = []
-    total_samples = 0
+    lambda_class_reg = config['train'].get('lambda_class_reg', 0.0)
+    lambda_grp_reg = config['train'].get('lambda_grp_reg', 0.0)
 
-    for r, crit in enumerate(criterion):
-        mask = (ids == r)
-        n_r = mask.sum()
+    ab_classes = config['vocab'].get('ab_class', {})
+    sp_grps = config['vocab'].get('sp_grp', {})
+    species_to_group = {sp: grp for grp, species_list in sp_grps.items() for sp in species_list}
 
-        if n_r == 0:
+    for ab_idx, (ab_name, logits_ab) in enumerate(zip(antibiotics, logits_list)):
+        mask = y_pos[:, ab_idx] == 1
+        if not mask.any():
             continue
 
-        base_losses = crit(output_logits[mask], targets[mask]) 
-        per_sample_losses[mask] = base_losses.detach()
+        logits = logits_ab[mask]
+        targets_ab = y_resp[mask, ab_idx] 
+        species_ab = np.array(species)[mask.cpu().numpy()]
 
-        weighted_losses.append(base_losses.mean() * n_r)
-        total_samples += n_r
+        crit = criterion[ab_name]
+        sample_losses = crit(logits, targets_ab)
 
-    if total_samples > 0:
-        loss = sum(weighted_losses) / total_samples
-    else:
-        loss = torch.tensor(0.0, device=device)
+        per_sample_losses.append(sample_losses)
 
-    if train:
-        unreg_loss = loss.clone()
-        lambda_class_reg = config['train'].get('lambda_class_reg', 0.0)
-        if lambda_class_reg > 0:
-            ab_classes = config['vocab'].get('ab_class', {})
-            reg_loss = _apply_regularization(output_logits, ids, antibiotics,
-                                             ab_classes, lambda_class_reg, device)
-            loss = loss + reg_loss
+        loss_total += sample_losses.sum()
+        n_total += sample_losses.numel()
 
-        lambda_grp_reg = config['train'].get('lambda_grp_reg', 0.0)
-        if lambda_grp_reg > 0:
-            sp_grps = config['vocab'].get('sp_grp', {})
-            reg_loss = _apply_regularization(output_logits, ids, species,
-                                             sp_grps, lambda_grp_reg, device)
-            loss = loss + reg_loss
-        
-        return loss, per_sample_losses, unreg_loss
+        if train:
+            antibiotic_indices = torch.full(
+                (logits.size(0),),
+                ab_idx,
+                dtype=torch.long,
+                device=device
+            )
+
+            if lambda_class_reg > 0:
+                loss_total += lambda_class_reg * _apply_regularization(logits, antibiotic_indices,
+                                                                       [ab_name] * logits.size(0),
+                                                                       ab_classes, 1.0, device)
+
+            if lambda_grp_reg > 0:
+                loss_total += lambda_grp_reg * _apply_regularization(logits, antibiotic_indices,
+                                                                     species_ab, species_to_group, 
+                                                                     1.0, device)
+                
+    if n_total == 0:
+        return torch.tensor(0.0, device=device), torch.tensor([], device=device)
+
+    loss = loss_total / n_total
+    per_sample_losses = torch.cat(per_sample_losses)
+
+    return loss, per_sample_losses
     
-    else:
-        return loss, per_sample_losses
+#def compute_classification_thresholds(df):
+#    thresholds = {}
+#    for ab, g in df.groupby(['antibiotic', 'species', 'n_ast_results']):
+#        y_true = g['true'].values
+#        y_score = g['softmax_score'].values
+
+#        if len(np.unique(y_true)) < 2:
+#            thresholds[ab] = 0.5
+#            continue
+
+#        fpr, tpr, thr = roc_curve(y_true, y_score)
+
+#        dist = np.sqrt((1 - tpr)**2 + fpr**2)
+#        best_point = thr[np.argmin(dist)]
+
+#        thresholds[ab] = best_point
     
-def compute_classification_thresholds(df):
-    thresholds = {}
-    for ab, g in df.groupby(['antibiotic', 'species', 'n_ast_results']):
-        y_true = g['true'].values
-        y_score = g['softmax_score'].values
+#    return thresholds
 
-        if len(np.unique(y_true)) < 2:
-            thresholds[ab] = 0.5
-            continue
+#def define_thresholds(pS, pR, y, n_classes, error_limit, phenotype):
+#    taus = np.linspace(0,1,1000)
+#    y_true = numeric_to_phenotype(y, n_classes)
 
-        fpr, tpr, thr = roc_curve(y_true, y_score)
+#    if phenotype == 'R':
+#        pred_R = pR[:,None] >= taus
+#        true_R = y_true == 'R'
 
-        dist = np.sqrt((1 - tpr)**2 + fpr**2)
-        best_point = thr[np.argmin(dist)]
-
-        thresholds[ab] = best_point
+#        vme = ((true_R[:,None]) & (~pred_R) & (pS[:,None] >= 0.5)).sum(axis=0)
+#        error_rate = vme / true_R.sum()
     
-    return thresholds
+#    elif phenotype == 'S':
+#        pred_S = pS[:,None] >= taus
+#        true_S = y_true == 'S'
 
-def compute_final_metrics(results_df):
+#        me = ((true_S[:,None]) & (~pred_S) & (pR[:,None] >= 0.5)).sum(axis=0)
+#        error_rate = me / true_S.sum()
+
+#    valid = taus[error_rate <= error_limit]
+
+#    return valid
+
+def _compile_output(results_df, config):
+    n_outputs_per_antibiotic = config['model']['n_outputs_per_antibiotic']
     records = []
-    for (sp, abx, tpe, n_ast), g in results_df.groupby(['species', 'antibiotic', 'sample_type', 'n_ast_results']):
-        y_true = g['true'].astype(int)
-        y_pred = g['pred'].astype(int)
-        losses = g['loss'].astype(float)
 
-        TP = ((y_true == 1) & (y_pred == 1)).sum()
-        TN = ((y_true == 0) & (y_pred == 0)).sum()
-        FP = ((y_true == 0) & (y_pred == 1)).sum()
-        FN = ((y_true == 1) & (y_pred == 0)).sum()
+    for (sp, abx, tpe, n_ast), g in results_df.groupby(['species', 'antibiotic', 'sample_type', 'n_ast_results']):
+        y_true = g['true'].astype(int).values
+        y_pred = g['pred'].astype(int).values
+
+        n_classes = n_outputs_per_antibiotic[abx]
+        y_true_phenotype = numeric_to_phenotype(y_true, n_classes)
+        y_pred_phenotype = numeric_to_phenotype(y_pred, n_classes)
+
+        pStS = ((y_true_phenotype == 'S') & (y_pred_phenotype == 'S')).sum()
+        pItS = ((y_true_phenotype == 'I') & (y_pred_phenotype == 'S')).sum()
+        pRtS = ((y_true_phenotype == 'R') & (y_pred_phenotype == 'S')).sum()
+        pStI = ((y_true_phenotype == 'S') & (y_pred_phenotype == 'I')).sum()
+        pItI = ((y_true_phenotype == 'I') & (y_pred_phenotype == 'I')).sum()
+        pRtI = ((y_true_phenotype == 'R') & (y_pred_phenotype == 'I')).sum()
+        pStR = ((y_true_phenotype == 'S') & (y_pred_phenotype == 'R')).sum()
+        pItR = ((y_true_phenotype == 'I') & (y_pred_phenotype == 'R')).sum()
+        pRtR = ((y_true_phenotype == 'R') & (y_pred_phenotype == 'R')).sum()
 
         records.append({
             'species': sp,
             'antibiotic': abx,
             'sample_type': tpe,
             'n_ast_results': n_ast,
-            'TP': TP,
-            'TN': TN,
-            'FP': FP,
-            'FN': FN,
-            'n_samples': len(g),
-            'loss_mean': losses.mean(),
-            'loss_median': losses.median(),
-            'loss_std': losses.std(),
+            'pStS': pStS,
+            'pItS': pItS,
+            'pRtS': pRtS,
+            'pStI': pStI,
+            'pItI': pItI,
+            'pRtI': pRtI,
+            'pStR': pStR,
+            'pItR': pItR,
+            'pRtR': pRtR,
+            'n_samples': len(g)
         })
         
     return pd.DataFrame(records)
 
-
-def forward_epoch(df, config, amr_prediction_model, criterion, optimizer, scheduler, epoch_idx, device, vocab, pad_id, train=True, test=False, thresholds=None):
+def forward_epoch(df, config, amr_prediction_model, criterion, optimizer, scheduler, epoch_idx, device, vocab, pad_id, train=True):
     model_cfg = config['model']
     data_cfg = config['train'] if train else config['test']
 
@@ -286,9 +333,9 @@ def forward_epoch(df, config, amr_prediction_model, criterion, optimizer, schedu
     obs_per_epoch = data_cfg['obs_per_epoch']
     isolates_per_batch = data_cfg['isolates_to_sample_per_batch']
     n_metadata = config['train']['n_metadata']
-    pos_response = model_cfg['pos_response']
-    antibiotics = [k.split('_')[0] for k in pos_response.keys()]
-    species = [x for xs in list(config['vocab']['sp_grp'].values()) for x in xs]
+    encode_response = model_cfg['encode_response']
+
+    antibiotics = list(dict.fromkeys(k.split('_')[0] for k in encode_response))
 
     num_workers = min(4, os.cpu_count() or 1)
     pin_memory = torch.cuda.is_available()
@@ -296,28 +343,30 @@ def forward_epoch(df, config, amr_prediction_model, criterion, optimizer, schedu
      
     x, y = expand_samples(df, config, isolates_per_batch, n_metadata, epoch_idx)
     idx = get_balanced_indices(x, y, obs_per_epoch)
+
     x = [x[j] for j in idx]
     y = [y[j] for j in idx]
 
-    dataset = ABTextDataset(x, y, vocab, antibiotics, max_seq_len, pos_response)
+    dataset = ABTextDataset(x, y, vocab, antibiotics, max_seq_len, encode_response)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size, shuffle=train, num_workers=num_workers, 
                                              pin_memory=pin_memory, persistent_workers=persistent_workers)
     
     n_batches = int(np.ceil(min(len(dataset), obs_per_epoch) / batch_size))
-    if train:
-        perform = torch.zeros(3, n_batches, dtype=torch.float32) - 1.0
-    else:
-        perform = torch.zeros(2, n_batches, dtype=torch.float32) - 1.0
+    perform = torch.zeros(2, n_batches, dtype=torch.float32) - 1.0
 
     amr_prediction_model.train() if train else amr_prediction_model.eval()
 
-    preds_list = []
-    softmax_list = []
+    preds_list = [] 
     trues_list = []
     losses_list = []
+
+    pS_list = []
+    pI_list = []
+    pR_list = []
+    
     all_species = []
-    all_sample_types = []
     all_antibiotics = []
+    all_sample_types = []
     all_n_ast = []
 
     batch_times = []
@@ -330,26 +379,10 @@ def forward_epoch(df, config, amr_prediction_model, criterion, optimizer, schedu
             torch.ones(token_ids.size(0), N_CONTINUOUS_FEATURES, device=device, dtype=torch.long),
             (token_ids != pad_id).long()
         ], dim=1)
-        
-        ids = torch.nonzero(y_pos, as_tuple=False)[:, 1]
-        targets = y_resp[y_pos].to(device)
-
-        batch_species = np.concatenate([np.repeat(species_batch[i], int(y_pos[i].sum())) for i in range(len(y_pos))]).tolist()
-        batch_sample_type = np.concatenate([np.repeat(sample_type_batch[i], int(y_pos[i].sum())) for i in range(len(y_pos))]).tolist()
-        batch_n_ast = np.concatenate([np.repeat(int(x_pos[i].sum().cpu().item()), int(y_pos[i].sum())) for i in range(len(y_pos))]).tolist()
-
-        ids_cpu = ids.cpu().numpy()
-        batch_antibiotics = [antibiotics[int(i)] for i in ids_cpu]
 
         with torch.set_grad_enabled(train):
-            output_logits = amr_prediction_model(token_ids, year, month, age, y_pos, attention_mask)
-            output_logits_flat = output_logits[y_pos]
-            softmax_scores = torch.softmax(output_logits_flat, dim=1)
-
-            if train:
-                loss, per_sample_losses, unreg_loss = _compute_loss(output_logits_flat, targets, ids, criterion, train, config, antibiotics, species, device)
-            else:
-                loss, per_sample_losses = _compute_loss(output_logits_flat, targets, ids, criterion, train, config, antibiotics, species, device)
+            logits_list = amr_prediction_model(token_ids, year, month, age, attention_mask)
+            loss, per_sample_losses = _compute_loss(logits_list, y_pos, y_resp, criterion, train, config, antibiotics, species_batch, device)
 
             if train and loss is not None:
                 optimizer.zero_grad()
@@ -358,60 +391,87 @@ def forward_epoch(df, config, amr_prediction_model, criterion, optimizer, schedu
                 optimizer.step()
                 scheduler.step()
 
-        if train:
-            loss_val = loss.item() if loss is not None else float('nan')
-            loss_unreg_val = unreg_loss.item() if unreg_loss is not None else float('nan')
-            acc = (torch.argmax(output_logits_flat, dim=1) == targets).float().mean().item()
-            perform[0, batch_idx] = loss_val
-            perform[1, batch_idx] = acc
-            perform[2, batch_idx] = loss_unreg_val
-        else:
-            loss_val = loss.item() if loss is not None else float('nan')
-            acc = (torch.argmax(output_logits_flat, dim=1) == targets).float().mean().item()
-            perform[0, batch_idx] = loss_val
-            perform[1, batch_idx] = acc
+        preds_batch = []
+        trues_batch = []
 
-        batch_softmax_np = softmax_scores.detach().cpu().numpy()
-        batch_targets_np = targets.detach().cpu().numpy()
-        batch_losses_np = per_sample_losses.detach().cpu().numpy()
+        loss_offset = 0
 
-        if thresholds is None:
-            batch_preds_np = torch.argmax(output_logits_flat, dim=1).detach().cpu().numpy()
-        else:
-            batch_preds_np = np.array([
-                1 if s >= thresholds.get((ab, sp, n_ast), 0.5) else 0
-                for s, ab, sp, n_ast in zip(
-                    batch_softmax_np[:, 1], 
-                    batch_antibiotics, 
-                    batch_species, 
-                    batch_n_ast)
-            ])
+        for ab_idx, logits_ab in enumerate(logits_list):
+            mask = y_pos[:, ab_idx] == 1
+            if mask.sum() == 0:
+                continue
 
-        preds_list.append(batch_preds_np)
-        softmax_list.append(batch_softmax_np)
-        trues_list.append(batch_targets_np)
-        losses_list.append(batch_losses_np)
-        all_antibiotics.extend(batch_antibiotics)
-        all_species.extend(batch_species)
-        all_sample_types.extend(batch_sample_type)
-        all_n_ast.extend(batch_n_ast)
+            logits = logits_ab[mask]
+            targets = y_resp[mask, ab_idx]
 
-        batch_time = time.time() - start_time
-        batch_times.append(batch_time)
+            softmax = torch.softmax(logits, dim=1)
+            preds = torch.argmax(softmax, dim=1)
+
+            n_outputs = config['model']['n_outputs_per_antibiotic'][antibiotics[ab_idx]]
+
+            if n_outputs == 2:
+                pS = softmax[:, 0]
+                pR = softmax[:, 1]
+                pI = torch.zeros_like(pS) 
+
+            else:
+                pS = softmax[:, 0]
+                pI = softmax[:, 1]
+                pR = softmax[:, 2]
+
+            n = logits.size(0)
+            n_ast_per_sample = x_pos.sum(dim=1).cpu().numpy()
+            sample_indices = mask.nonzero(as_tuple=False).squeeze(1)
+            batch_species_flat = [species_batch[i] for i in sample_indices]
+            batch_sample_type_flat = [sample_type_batch[i] for i in sample_indices]
+            batch_n_ast_flat = [int(n_ast_per_sample[i]) for i in sample_indices]
+
+            all_species.extend(batch_species_flat)
+            all_sample_types.extend(batch_sample_type_flat)
+            all_n_ast.extend(batch_n_ast_flat)
+            all_antibiotics.extend([antibiotics[ab_idx]] * len(batch_species_flat))
+
+            preds_list.append(preds.cpu().numpy())
+            trues_list.append(targets.cpu().numpy())
+            pS_list.append(pS.detach().cpu().numpy())
+            pI_list.append(pI.detach().cpu().numpy())
+            pR_list.append(pR.detach().cpu().numpy())
+
+            preds_batch.append(preds)
+            trues_batch.append(targets)
+  
+            losses_all = per_sample_losses[loss_offset:loss_offset + n]
+            losses_list.append(losses_all.detach().cpu().numpy())
+            loss_offset += n
+
+        preds_all = torch.cat(preds_batch)
+        trues_all = torch.cat(trues_batch)
+
+        acc = (preds_all == trues_all).float().mean().item()
+        loss_val = loss.item() if loss is not None else float('nan')
+
+        perform[0, batch_idx] = loss_val
+        perform[1, batch_idx] = acc
+
+        batch_times.append(time.time() - start_time)
 
         if batch_idx + 1 == n_batches:
             break
 
     if preds_list:
         preds = np.concatenate(preds_list, axis=0)
-        softmaxes = np.concatenate(softmax_list, axis=0)
-        trues = np.concatenate(trues_list, axis=0)
+        trues = np.concatenate(trues_list, axis=0) 
         losses = np.concatenate(losses_list, axis=0)
+        pS = np.concatenate(pS_list)
+        pI = np.concatenate(pI_list)
+        pR = np.concatenate(pR_list)
     else:
         preds = np.array([], dtype=int)
-        softmaxes = np.array([]).reshape(0, 2)
-        trues = np.array([], dtype=int)
+        trues = np.array([], dtype=int) 
         losses = np.array([])
+        pS = np.array([])
+        pI = np.array([])
+        pR = np.array([])
 
     results_df = pd.DataFrame({
         'species': all_species,
@@ -421,7 +481,9 @@ def forward_epoch(df, config, amr_prediction_model, criterion, optimizer, schedu
         'pred': preds,
         'loss': losses,
         'n_ast_results': all_n_ast,
-        'softmax_score': softmaxes[:, 1],
+        "pS": pS,
+        "pI": pI,
+        "pR": pR,
         'epoch': epoch_idx
     })
 
@@ -429,18 +491,12 @@ def forward_epoch(df, config, amr_prediction_model, criterion, optimizer, schedu
     torch.cuda.empty_cache()
     gc.collect()
 
-    class_metrics_df = compute_final_metrics(results_df)
-    class_metrics_df['epoch'] = epoch_idx
+    summary_df = _compile_output(results_df, config)
+    summary_df['epoch'] = epoch_idx
 
-    if train is False and test is False:
-        thresholds = compute_classification_thresholds(results_df)
-        with open(model_cfg['thresholds'], 'wb') as f:
-            pkl.dump(thresholds, f)
-
-    return (perform, sum(batch_times), len(batch_times), class_metrics_df)
+    return (perform, sum(batch_times), len(batch_times), summary_df)
 
 def save_model(path, model):
-    """Save model state dict to path with error handling."""
     try:
         if isinstance(model, torch.nn.DataParallel):
             state_dict = model.module.state_dict()
@@ -467,7 +523,6 @@ def main():
     df['sentence'] = [x.split(' ') for x in df['sentence']]
     df_train = df.loc[df['fold'].isin(['train'])]
     df_val = df.loc[df['fold'].isin(['validation'])]
-    df_test = df.loc[df['fold'].isin(['test'])]
 
     rank = 0
     print('Initializing model...')
@@ -520,8 +575,7 @@ def main():
 
         perform_train, train_time, train_batch_count, train_results_df = forward_epoch(
             df_train, config, amr_prediction_model, criterion, 
-            optimizer, scheduler, epoch, device, vocab, pad_id, train=True, test=False, 
-            thresholds=None
+            optimizer, scheduler, epoch, device, vocab, pad_id, train=True
         )
 
         per_batch_time = train_time / train_batch_count
@@ -541,8 +595,6 @@ def main():
             'std_loss': perform_train[0, :].std().unsqueeze(0),
             'avg_acc': perform_train[1, :].mean().unsqueeze(0),
             'std_acc': perform_train[1, :].std().unsqueeze(0),
-            'avg_loss_unreg': perform_train[2, :].mean().unsqueeze(0),
-            'std_loss_unreg': perform_train[2, :].std().unsqueeze(0),
             'epoch': torch.tensor([epoch], dtype=torch.int32)
         })
 
@@ -554,8 +606,7 @@ def main():
 
         perform_val, _, val_batch_count, val_results_df = forward_epoch(
             df_val, config, amr_prediction_model, criterion, 
-            optimizer, None, epoch, device, vocab, pad_id, train=False, test=False, 
-            thresholds=None 
+            optimizer, None, epoch, device, vocab, pad_id, train=False
         )
 
         for _ in range(val_batch_count):
@@ -605,37 +656,6 @@ def main():
             print(f'Warning: Failed to save training state: {e}')
 
     print('Training complete!')
-
-    if rank == 0:
-        print(f'Starting final evaluation...')
-
-    try:
-        val_results_df = pd.read_csv(val_results_path, sep='\t')
-    except FileNotFoundError:
-        print(f'Warning: Validation results file not found at {val_results_path}')
-        val_results_df = None
-
-    thresholds_path = config['model']['thresholds']
-    if os.path.exists(thresholds_path):
-        try:
-            with open(thresholds_path, 'rb') as f:
-                thresholds = pkl.load(f)
-        except Exception as e:
-            print(f'Warning: Failed to load thresholds from {thresholds_path}: {e}')
-            thresholds = None
-    else:
-        print(f'Warning: Thresholds file not found at {thresholds_path}')
-        thresholds = None
-
-    _, _, _, test_results_df = forward_epoch(
-        df_test, config, amr_prediction_model, criterion,
-        optimizer, None, n_epochs, device, vocab, pad_id, train=False, test=True, 
-        thresholds=thresholds
-        )
-    
-    test_results_path = os.path.join(arguments.folder, 'test_results.tsv')
-    test_results_df.to_csv(test_results_path, sep='\t', index=False)
-    print(f'Test results saved to {test_results_path}')
 
 if __name__ == '__main__':
     main()
