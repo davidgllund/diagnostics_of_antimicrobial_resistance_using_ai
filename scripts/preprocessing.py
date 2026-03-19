@@ -45,8 +45,11 @@ def prefilter_dataset(df, taxonomy):
     ]
 
     df = df.fillna('<unk>')
-    first_word = df['smittamne_namn'].str.split(" ", n=1).str[0]
-    df = df[first_word.isin(taxonomy)]
+    genus = df['smittamne_namn'].str.split(" ", n=1).str[0]
+    df = df[genus.isin(taxonomy)]
+
+    species = df['smittamne_namn'].str.split(" ", n=1).str[1]
+    df = df[species != "art"]
 
     return df
 
@@ -73,8 +76,6 @@ def format_dataset(df, antibiotic_map, species_map, sample_map):
     }).fillna('<unk>')
 
     df['smittamne_namn'] = df['smittamne_namn'].replace({
-        'Viridansstreptokocker': 'Streptococcus art',
-        'Koagulasnegativa stafylokocker': 'Staphylococcus art',
         'EHEC (Enterohemorragisk E. coli)': 'Escherichia coli'
     })
 
@@ -82,7 +83,9 @@ def format_dataset(df, antibiotic_map, species_map, sample_map):
     df['antibiotikum_namn'] = df['antibiotikum_namn'].str.replace(r"\s*\(.*\)", "", regex=True)
     df['antibiotic'] = df['antibiotikum_namn'].map(antibiotic_map)
     df['pathogen'] = df['smittamne_namn'].map(species_map)
-    df['specimen'] = df['provmaterial_namn'].map(sample_map) 
+    df['specimen'] = df['provmaterial_namn'].map(sample_map)
+
+    df = df.loc[df['specimen'] != 'IGNORE'] 
 
     df = df.rename(columns={
         'provtagnings_datum': 'date',
