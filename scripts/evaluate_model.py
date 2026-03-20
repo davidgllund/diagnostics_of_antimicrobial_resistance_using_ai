@@ -24,7 +24,7 @@ def parse_args(argv):
 
     return arguments
 
-def evaluate_model(df, config, amr_prediction_model, epoch_idx, device, vocab, pad_id):
+def predict_ast_results(df, config, amr_prediction_model, epoch_idx, device, vocab, pad_id):
     model_cfg = config['model']
     data_cfg = config['test']
 
@@ -232,6 +232,9 @@ def conf_pred(cal_results, eval_results, config):
 
     results_out['conformal_set'] = conformal_sets
     results_out['q_hat'] = q_used
+
+    # Filter out antibiotic-species combination without q_hat for all phenotypes
+    results_out = results_out[results_out['q_hat'].apply(lambda x: None not in x)]
  
     return results_out
 
@@ -259,9 +262,9 @@ def main():
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     amr_model.to(device)
 
-    print('Evaluating model...')
-    cal_results_df = evaluate_model(df_cal, config, amr_model, 100, device, vocab, pad_id)
-    eval_results_df = evaluate_model(df_eval, config, amr_model, 100, device, vocab, pad_id)
+    print('Predicting AST results...')
+    cal_results_df = predict_ast_results(df_cal, config, amr_model, 100, device, vocab, pad_id)
+    eval_results_df = predict_ast_results(df_eval, config, amr_model, 100, device, vocab, pad_id)
 
     print('Summarizing predictions...')
     class_metrics_df = _compile_output(eval_results_df, config) 
