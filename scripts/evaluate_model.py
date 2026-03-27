@@ -10,7 +10,7 @@ import pickle as pkl
 import gc
 
 from model_utils import load_previous_model, create_model
-from aux import ABTextDataset, expand_samples, get_balanced_indices
+from aux import ABTextDataset, expand_samples, get_balanced_indices, to_device
 
 N_CONTINUOUS_FEATURES = 3 
 
