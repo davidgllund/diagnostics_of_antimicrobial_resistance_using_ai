@@ -1,7 +1,5 @@
 #!/usr/bin/env python
-import torch
-import torch.nn as nn
-import torch.optim as optim
+import torch 
 import os
 import time 
 import argparse
@@ -11,148 +9,21 @@ import numpy as np
 import pandas as pd
 import random
 import gc
-import sys
+from sys import argv
 
 from transformers import get_linear_schedule_with_warmup
 #from sklearn.metrics import roc_curve
-from aux import ABTextDataset, expand_samples, get_balanced_indices, to_device, append_df_to_tsv, update_ema, print_progress, numeric_to_phenotype
-from model import AMRPredictionModel
+from aux import ABTextDataset, expand_samples, get_balanced_indices, to_device, append_df_to_tsv, update_ema, print_progress, numeric_to_phenotype 
+from model_utils import create_model, load_previous_model, load_previous_state, start_optimizer_loss, save_model
+from evaluate_model import predict_ast_results
 
 N_CONTINUOUS_FEATURES = 3 
 
-def parse_args():
+def parse_args(argv):
     parser = argparse.ArgumentParser(description='Train transformer model for AST prediction.')
     parser.add_argument('--config', '-c', required=True, help='Config file name.')
     parser.add_argument('--folder', '-f', required=True, help='Config/output folder.')
     return parser.parse_args()
-
-def create_model(config, pad_id, rank=0):
-    model_cfg = config['model']
-    vocab_cfg = config['vocab']
-
-    print('Creating AMR prediction model...')
-    amr_prediction_model = AMRPredictionModel(
-        embedding_size=model_cfg['embedding_size'],
-        n_antibiotics=model_cfg['n_antibiotics'],
-        antibiotics=list(dict.fromkeys(k.split('_')[0] for k in model_cfg['encode_response'])),
-        layer_norm_eps=model_cfg['layer_norm_eps'],
-        n_heads=model_cfg['n_heads'],
-        encoder_stack_depth=model_cfg['encoder_stack_depth'],
-        ffn_dimension=model_cfg['ffn_dimension'],
-        max_seq_len=model_cfg['max_seq_len'],
-        vocab_size=vocab_cfg['vocab_size'],
-        pad_id=pad_id,
-        dropout_rate_attn=model_cfg['dropout_rate_attn'],
-        n_outputs_per_antibiotic=model_cfg['n_outputs_per_antibiotic']
-    )
-    print(f'Model parameters: {sum(p.numel() for p in amr_prediction_model.parameters() if p.requires_grad):,}')
-    return amr_prediction_model
-
-def load_previous_model(model_folder, amr_prediction_model, rank=0, load_previous=True):
-    def log(msg: str):
-        if rank == 0:
-            print(msg)
-
-    log('Loading previous model (?)')
-    if not load_previous:
-        log('No')
-        return None   
-    log('Yes')
-
-    model_path = os.path.join(model_folder, 'pretrain_amr_prediction_model.torch')
-    state_path = os.path.join(model_folder, 'pretrain_state.pkl')
-
-    state = None
-
-    if os.path.exists(model_path):
-        try:
-            log('Loading previous model weights...')
-            map_loc = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
-            state_dict = torch.load(model_path, map_location=map_loc)
-            amr_prediction_model.load_state_dict(state_dict)
-        except Exception as e:
-            log(f'Warning: Failed to load model weights: {e}')
-
-    if os.path.exists(state_path):
-        try:
-            log('Loading previous state...')
-            with open(state_path, 'rb') as f:
-                state = pkl.load(f)
-        except Exception as e:
-            log(f'Warning: Failed to load state: {e}')
-    else:
-        log('No previous state found.')
-
-    return state
-
-def load_previous_state(model_folder, n_epochs, rank=0):
-    if rank == 0:
-        print('Checking for previous state...')
-
-    train_results_path = os.path.join(model_folder, 'avg_train_performance.tsv')
-    val_results_path = os.path.join(model_folder, 'avg_val_performance.tsv')
-
-    train_loss = torch.zeros((n_epochs, 1))
-    val_loss = torch.zeros((n_epochs, 1))
-
-    start_epoch = 0
-    min_val_loss = 1000
-    avg_batch_time = 0
-    total_time = 0
-    processed_batches = 0
-
-    if not os.path.exists(train_results_path) or not os.path.exists(val_results_path):
-        if rank == 0:
-            print('No previous logs found. Starting from scratch.')
-        return train_loss, val_loss, start_epoch, avg_batch_time, total_time, processed_batches, min_val_loss
-    
-    df_train_log = pd.read_csv(train_results_path, sep="\t")
-    df_val_log   = pd.read_csv(val_results_path, sep="\t")
-
-    if df_train_log.empty or df_val_log.empty:
-        if rank == 0:
-            print('Log files empty. Starting from scratch.')
-        return train_loss, val_loss, start_epoch, avg_batch_time, total_time, processed_batches, min_val_loss
-    
-    last_train_epoch = df_train_log['epoch'].max()
-    last_val_epoch = df_val_log['epoch'].max()
-    last_epoch = min(last_train_epoch, last_val_epoch)
-
-    for e in range(last_epoch + 1):
-        g_train = df_train_log[df_train_log['epoch'] == e]
-        g_val   = df_val_log[df_val_log['epoch'] == e]
-
-        if not g_train.empty:
-            train_loss[e] = g_train['avg_loss'].mean()
-
-        if not g_val.empty:
-            val_loss[e] = g_val['avg_loss'].mean()
-
-    min_val_loss = float(val_loss[: last_epoch + 1].min())
-
-    if rank == 0:
-        print(f'Resuming training from epoch {last_epoch + 1} (min val loss: {min_val_loss:.4f})')
-
-    start_epoch = last_epoch + 1
-    return train_loss, val_loss, start_epoch, avg_batch_time, total_time, processed_batches, min_val_loss
-
-def start_optimizer_loss(config, amr_prediction_model, rank=0):
-    if rank == 0:
-        print('Initializing optimizer and loss functions...')
-
-    model_cfg = config['model']
-    train_cfg = config['train']
-    encode_response = model_cfg['encode_response']
-
-    antibiotics = list(dict.fromkeys(k.split('_')[0] for k in encode_response))
-
-    criterion = {}
-    for ab in antibiotics:
-        criterion[ab] = nn.CrossEntropyLoss(reduction='none')
-
-    optimizer = optim.Adam(params=amr_prediction_model.parameters(), lr=train_cfg['learning_rate'])
-    
-    return criterion, optimizer
 
 def _apply_regularization(logits, antibiotic_indices, words, classes, lambda_reg, device):
     wrd_to_class = [classes.get(wrd, 'unknown') for wrd in words]
@@ -190,7 +61,6 @@ def _apply_regularization(logits, antibiotic_indices, words, classes, lambda_reg
 def _compute_loss(logits_list, y_pos, y_resp, criterion, train, config, antibiotics, species, device):
     loss_total = torch.tensor(0.0, device=device)
     n_total = 0
-    per_sample_losses = []
 
     lambda_class_reg = config['train'].get('lambda_class_reg', 0.0)
     lambda_grp_reg = config['train'].get('lambda_grp_reg', 0.0)
@@ -210,8 +80,6 @@ def _compute_loss(logits_list, y_pos, y_resp, criterion, train, config, antibiot
 
         crit = criterion[ab_name]
         sample_losses = crit(logits, targets_ab)
-
-        per_sample_losses.append(sample_losses)
 
         loss_total += sample_losses.sum()
         n_total += sample_losses.numel()
@@ -235,12 +103,11 @@ def _compute_loss(logits_list, y_pos, y_resp, criterion, train, config, antibiot
                                                                      1.0, device)
                 
     if n_total == 0:
-        return torch.tensor(0.0, device=device), torch.tensor([], device=device)
+        return None, None
 
     loss = loss_total / n_total
-    per_sample_losses = torch.cat(per_sample_losses)
 
-    return loss, per_sample_losses
+    return loss
     
 #def compute_classification_thresholds(df):
 #    thresholds = {}
@@ -261,68 +128,27 @@ def _compute_loss(logits_list, y_pos, y_resp, criterion, train, config, antibiot
     
 #    return thresholds
 
-#def define_thresholds(pS, pR, y, n_classes, error_limit, phenotype):
-#    taus = np.linspace(0,1,1000)
-#    y_true = numeric_to_phenotype(y, n_classes)
+def define_thresholds(pS, pR, y, n_classes, error_limit, phenotype):
+    taus = np.linspace(0,1,1000)
+    y_true = numeric_to_phenotype(y, n_classes)
 
-#    if phenotype == 'R':
-#        pred_R = pR[:,None] >= taus
-#        true_R = y_true == 'R'
+    if phenotype == 'R':
+        pred_R = pR[:,None] >= taus
+        true_R = y_true == 'R'
 
-#        vme = ((true_R[:,None]) & (~pred_R) & (pS[:,None] >= 0.5)).sum(axis=0)
-#        error_rate = vme / true_R.sum()
+        vme = ((true_R[:,None]) & (~pred_R) & (pS[:,None] >= 0.5)).sum(axis=0)
+        error_rate = vme / true_R.sum()
     
-#    elif phenotype == 'S':
-#        pred_S = pS[:,None] >= taus
-#        true_S = y_true == 'S'
+    elif phenotype == 'S':
+        pred_S = pS[:,None] >= taus
+        true_S = y_true == 'S'
 
-#        me = ((true_S[:,None]) & (~pred_S) & (pR[:,None] >= 0.5)).sum(axis=0)
-#        error_rate = me / true_S.sum()
+        me = ((true_S[:,None]) & (~pred_S) & (pR[:,None] >= 0.5)).sum(axis=0)
+        error_rate = me / true_S.sum()
 
-#    valid = taus[error_rate <= error_limit]
+    valid = taus[error_rate <= error_limit]
 
-#    return valid
-
-def _compile_output(results_df, config):
-    n_outputs_per_antibiotic = config['model']['n_outputs_per_antibiotic']
-    records = []
-
-    for (sp, abx, tpe, n_ast), g in results_df.groupby(['species', 'antibiotic', 'sample_type', 'n_ast_results']):
-        y_true = g['true'].astype(int).values
-        y_pred = g['pred'].astype(int).values
-
-        n_classes = n_outputs_per_antibiotic[abx]
-        y_true_phenotype = numeric_to_phenotype(y_true, n_classes)
-        y_pred_phenotype = numeric_to_phenotype(y_pred, n_classes)
-
-        pStS = ((y_true_phenotype == 'S') & (y_pred_phenotype == 'S')).sum()
-        pItS = ((y_true_phenotype == 'I') & (y_pred_phenotype == 'S')).sum()
-        pRtS = ((y_true_phenotype == 'R') & (y_pred_phenotype == 'S')).sum()
-        pStI = ((y_true_phenotype == 'S') & (y_pred_phenotype == 'I')).sum()
-        pItI = ((y_true_phenotype == 'I') & (y_pred_phenotype == 'I')).sum()
-        pRtI = ((y_true_phenotype == 'R') & (y_pred_phenotype == 'I')).sum()
-        pStR = ((y_true_phenotype == 'S') & (y_pred_phenotype == 'R')).sum()
-        pItR = ((y_true_phenotype == 'I') & (y_pred_phenotype == 'R')).sum()
-        pRtR = ((y_true_phenotype == 'R') & (y_pred_phenotype == 'R')).sum()
-
-        records.append({
-            'species': sp,
-            'antibiotic': abx,
-            'sample_type': tpe,
-            'n_ast_results': n_ast,
-            'pStS': pStS,
-            'pItS': pItS,
-            'pRtS': pRtS,
-            'pStI': pStI,
-            'pItI': pItI,
-            'pRtI': pRtI,
-            'pStR': pStR,
-            'pItR': pItR,
-            'pRtR': pRtR,
-            'n_samples': len(g)
-        })
-        
-    return pd.DataFrame(records)
+    return valid
 
 def forward_epoch(df, config, amr_prediction_model, criterion, optimizer, scheduler, epoch_idx, device, vocab, pad_id, train=True):
     model_cfg = config['model']
@@ -352,22 +178,12 @@ def forward_epoch(df, config, amr_prediction_model, criterion, optimizer, schedu
                                              pin_memory=pin_memory, persistent_workers=persistent_workers)
     
     n_batches = int(np.ceil(min(len(dataset), obs_per_epoch) / batch_size))
-    perform = torch.zeros(2, n_batches, dtype=torch.float32) - 1.0
 
     amr_prediction_model.train() if train else amr_prediction_model.eval()
 
-    preds_list = [] 
-    trues_list = []
-    losses_list = []
-
-    pS_list = []
-    pI_list = []
-    pR_list = []
-    
-    all_species = []
-    all_antibiotics = []
-    all_sample_types = []
-    all_n_ast = []
+    total_loss = 0
+    total_correct = 0
+    total_samples = 0
 
     batch_times = []
 
@@ -382,19 +198,21 @@ def forward_epoch(df, config, amr_prediction_model, criterion, optimizer, schedu
 
         with torch.set_grad_enabled(train):
             logits_list = amr_prediction_model(token_ids, year, month, age, attention_mask)
-            loss, per_sample_losses = _compute_loss(logits_list, y_pos, y_resp, criterion, train, config, antibiotics, species_batch, device)
+            loss = _compute_loss(logits_list, y_pos, y_resp, criterion, train, config, antibiotics, species_batch, device)
 
-            if train and loss is not None:
+            if loss is None:
+                continue
+
+            if train:
                 optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(amr_prediction_model.parameters(), 1.0)
                 optimizer.step()
                 scheduler.step()
 
-        preds_batch = []
-        trues_batch = []
 
-        loss_offset = 0
+        correct = 0
+        count = 0
 
         for ab_idx, logits_ab in enumerate(logits_list):
             mask = y_pos[:, ab_idx] == 1
@@ -407,108 +225,28 @@ def forward_epoch(df, config, amr_prediction_model, criterion, optimizer, schedu
             softmax = torch.softmax(logits, dim=1)
             preds = torch.argmax(softmax, dim=1)
 
-            n_outputs = config['model']['n_outputs_per_antibiotic'][antibiotics[ab_idx]]
-
-            if n_outputs == 2:
-                pS = softmax[:, 0]
-                pR = softmax[:, 1]
-                pI = torch.zeros_like(pS) 
-
-            else:
-                pS = softmax[:, 0]
-                pI = softmax[:, 1]
-                pR = softmax[:, 2]
-
-            n = logits.size(0)
-            n_ast_per_sample = x_pos.sum(dim=1).cpu().numpy()
-            sample_indices = mask.nonzero(as_tuple=False).squeeze(1)
-            batch_species_flat = [species_batch[i] for i in sample_indices]
-            batch_sample_type_flat = [sample_type_batch[i] for i in sample_indices]
-            batch_n_ast_flat = [int(n_ast_per_sample[i]) for i in sample_indices]
-
-            all_species.extend(batch_species_flat)
-            all_sample_types.extend(batch_sample_type_flat)
-            all_n_ast.extend(batch_n_ast_flat)
-            all_antibiotics.extend([antibiotics[ab_idx]] * len(batch_species_flat))
-
-            preds_list.append(preds.cpu().numpy())
-            trues_list.append(targets.cpu().numpy())
-            pS_list.append(pS.detach().cpu().numpy())
-            pI_list.append(pI.detach().cpu().numpy())
-            pR_list.append(pR.detach().cpu().numpy())
-
-            preds_batch.append(preds)
-            trues_batch.append(targets)
-  
-            losses_all = per_sample_losses[loss_offset:loss_offset + n]
-            losses_list.append(losses_all.detach().cpu().numpy())
-            loss_offset += n
-
-        preds_all = torch.cat(preds_batch)
-        trues_all = torch.cat(trues_batch)
-
-        acc = (preds_all == trues_all).float().mean().item()
-        loss_val = loss.item() if loss is not None else float('nan')
-
-        perform[0, batch_idx] = loss_val
-        perform[1, batch_idx] = acc
+            correct += (preds == targets).sum().item()
+            count += targets.numel()
+ 
+        total_loss += loss.item() * count
+        total_correct += correct
+        total_samples += count
 
         batch_times.append(time.time() - start_time)
 
         if batch_idx + 1 == n_batches:
             break
 
-    if preds_list:
-        preds = np.concatenate(preds_list, axis=0)
-        trues = np.concatenate(trues_list, axis=0) 
-        losses = np.concatenate(losses_list, axis=0)
-        pS = np.concatenate(pS_list)
-        pI = np.concatenate(pI_list)
-        pR = np.concatenate(pR_list)
-    else:
-        preds = np.array([], dtype=int)
-        trues = np.array([], dtype=int) 
-        losses = np.array([])
-        pS = np.array([])
-        pI = np.array([])
-        pR = np.array([])
+    avg_loss = total_loss / total_samples
+    avg_acc = total_correct / total_samples
 
-    results_df = pd.DataFrame({
-        'species': all_species,
-        'antibiotic': all_antibiotics,
-        'sample_type': all_sample_types,
-        'true': trues,
-        'pred': preds,
-        'loss': losses,
-        'n_ast_results': all_n_ast,
-        "pS": pS,
-        "pI": pI,
-        "pR": pR,
-        'epoch': epoch_idx
-    })
+    epoch_time = sum(batch_times)
+    batch_count = len(batch_times)
 
-    del token_ids, x_resp, x_pos, y_resp, y_pos, targets, x, y, dataset, dataloader
-    torch.cuda.empty_cache()
-    gc.collect()
-
-    summary_df = _compile_output(results_df, config)
-    summary_df['epoch'] = epoch_idx
-
-    return (perform, sum(batch_times), len(batch_times), summary_df)
-
-def save_model(path, model):
-    try:
-        if isinstance(model, torch.nn.DataParallel):
-            state_dict = model.module.state_dict()
-        else:
-            state_dict = model.state_dict()
-        
-        torch.save(state_dict, path)
-    except Exception as e:
-        print(f'Error saving model to {path}: {e}')
+    return avg_loss, avg_acc, epoch_time, batch_count
 
 def main():
-    arguments = parse_args()
+    arguments = parse_args(argv)
     os.makedirs(arguments.folder, exist_ok=True)
     
     with open(os.path.join(arguments.folder, arguments.config), 'r') as f:
@@ -545,9 +283,7 @@ def main():
     torch.manual_seed(2025)
     random.seed(2025)
 
-    train_results_path = os.path.join(arguments.folder, 'training_results.tsv')
     train_perf_path = os.path.join(arguments.folder, 'avg_train_performance.tsv')
-    val_results_path = os.path.join(arguments.folder, 'validation_results.tsv')
     val_perf_path = os.path.join(arguments.folder, 'avg_val_performance.tsv')
 
     ema_batch_time = None
@@ -573,7 +309,7 @@ def main():
         step_in_epoch = 0
         epoch_start = time.time()
 
-        perform_train, train_time, train_batch_count, train_results_df = forward_epoch(
+        train_loss, train_acc, train_time, train_batch_count = forward_epoch(
             df_train, config, amr_prediction_model, criterion, 
             optimizer, scheduler, epoch, device, vocab, pad_id, train=True
         )
@@ -587,24 +323,19 @@ def main():
             print_progress(epoch, step_in_epoch, batches_per_epoch,
                         processed_batches_global, total_training_batches,
                         ema_batch_time, epoch_start)
-
-        append_df_to_tsv(train_results_path, train_results_df)
-
+ 
         avg_train_results = pd.DataFrame({
-            'avg_loss': perform_train[0, :].mean().unsqueeze(0),
-            'std_loss': perform_train[0, :].std().unsqueeze(0),
-            'avg_acc': perform_train[1, :].mean().unsqueeze(0),
-            'std_acc': perform_train[1, :].std().unsqueeze(0),
-            'epoch': torch.tensor([epoch], dtype=torch.int32)
+            'avg_loss': [train_loss],
+            'avg_acc': [train_acc],
+            'epoch': [epoch]
         })
 
         append_df_to_tsv(train_perf_path, avg_train_results)
 
-        del train_results_df, avg_train_results
         gc.collect()
         torch.cuda.empty_cache()
 
-        perform_val, _, val_batch_count, val_results_df = forward_epoch(
+        val_loss, val_acc, _, val_batch_count = forward_epoch(
             df_val, config, amr_prediction_model, criterion, 
             optimizer, None, epoch, device, vocab, pad_id, train=False
         )
@@ -617,28 +348,22 @@ def main():
                         processed_batches_global, total_training_batches,
                         ema_batch_time, epoch_start)
 
-        append_df_to_tsv(val_results_path, val_results_df)
-
         avg_val_results = pd.DataFrame({
-            'avg_loss': perform_val[0, :].mean().unsqueeze(0),
-            'std_loss': perform_val[0, :].std().unsqueeze(0),
-            'avg_acc': perform_val[1, :].mean().unsqueeze(0),
-            'std_acc': perform_val[1, :].std().unsqueeze(0),
-            'epoch': torch.tensor([epoch], dtype=torch.int32)
+            'avg_loss': [val_loss],
+            'avg_acc': [val_acc],
+            'epoch': [epoch]
         })
 
         append_df_to_tsv(val_perf_path, avg_val_results)
 
-        del val_results_df
+        del avg_train_results, avg_val_results
         gc.collect()
         torch.cuda.empty_cache()
 
         print()
-        
-        avg_val_loss = torch.mean(perform_val[0, :])
 
-        if avg_val_loss < min_val_loss:
-            min_val_loss = avg_val_loss
+        if val_loss < min_val_loss:
+            min_val_loss = val_loss
             save_model(os.path.join(arguments.folder, 'pretrain_amr_prediction_model.torch'), amr_prediction_model)
 
         state = {
@@ -656,6 +381,10 @@ def main():
             print(f'Warning: Failed to save training state: {e}')
 
     print('Training complete!')
+
+    print('Computing classification thresholds...')
+    val_results_df = predict_ast_results(df_val, config, amr_prediction_model, n_epochs, device, vocab, pad_id, thresholds=None)
+
 
 if __name__ == '__main__':
     main()
