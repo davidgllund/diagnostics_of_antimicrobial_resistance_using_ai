@@ -9,9 +9,8 @@ import torch
 import pickle as pkl
 import gc
 
-from train_model import load_previous_model, create_model, _compile_output
-from aux import ABTextDataset, expand_samples, get_balanced_indices, to_device
-from sys import argv
+from model_utils import load_previous_model, create_model
+from aux import ABTextDataset, expand_samples, get_balanced_indices
 
 N_CONTINUOUS_FEATURES = 3 
 
@@ -24,7 +23,7 @@ def parse_args(argv):
 
     return arguments
 
-def predict_ast_results(df, config, amr_prediction_model, epoch_idx, device, vocab, pad_id):
+def predict_ast_results(df, config, amr_prediction_model, epoch_idx, device, vocab, pad_id, thresholds=None):
     model_cfg = config['model']
     data_cfg = config['test']
 
@@ -128,6 +127,7 @@ def predict_ast_results(df, config, amr_prediction_model, epoch_idx, device, voc
         pI = np.array([])
         pR = np.array([])
 
+    # Collect predictions
     results_df = pd.DataFrame({
         "species": all_species,
         "antibiotic": all_antibiotics,
@@ -140,9 +140,18 @@ def predict_ast_results(df, config, amr_prediction_model, epoch_idx, device, voc
         "pR": pR
     })
 
-    del token_ids, x_pos, y_resp, y_pos, x, y, dataset, dataloader
-    torch.cuda.empty_cache()
-    gc.collect()
+    # Convert from numeric to phenotype
+    n_outputs_per_antibiotic = config['model']['n_outputs_per_antibiotic']
+    for abx, n_cls in n_outputs_per_antibiotic.items():
+        mask = results_df['antibiotic'] == abx 
+
+        if n_cls == 2:
+            map_dict = {0:'S',1:'R'}
+        else:
+            map_dict = {0:'S',1:'I',2:'R'}
+
+        results_df.loc[mask,'true'] = results_df.loc[mask,'true'].map(map_dict)
+        results_df.loc[mask,'pred'] = results_df.loc[mask,'pred'].map(map_dict)
 
     return results_df
 
@@ -150,21 +159,7 @@ def conf_pred(cal_results, eval_results, config):
     min_group_size = 100 
     cal_results = cal_results.copy()
     results_out = eval_results.copy()
-
     n_outputs_per_antibiotic = config['model']['n_outputs_per_antibiotic']
-    for abx, n_cls in n_outputs_per_antibiotic.items():
-        mask_cal = cal_results['antibiotic'] == abx
-        mask_eval = results_out['antibiotic'] == abx
-
-        if n_cls == 2:
-            map_dict = {0:'S',1:'R'}
-        else:
-            map_dict = {0:'S',1:'I',2:'R'}
-
-        cal_results.loc[mask_cal,'true'] = cal_results.loc[mask_cal,'true'].map(map_dict)
-        cal_results.loc[mask_cal,'pred'] = cal_results.loc[mask_cal,'pred'].map(map_dict)
-        results_out.loc[mask_eval,'true'] = results_out.loc[mask_eval,'true'].map(map_dict)
-        results_out.loc[mask_eval,'pred'] = results_out.loc[mask_eval,'pred'].map(map_dict)
     
     cal_results['nonconf_S'] = 1.0 - cal_results['pS']
     cal_results['nonconf_I'] = 1.0 - cal_results['pI']
@@ -232,9 +227,6 @@ def conf_pred(cal_results, eval_results, config):
 
     results_out['conformal_set'] = conformal_sets
     results_out['q_hat'] = q_used
-
-    # Filter out antibiotic-species combination without q_hat for all phenotypes
-    results_out = results_out[results_out['q_hat'].apply(lambda x: None not in x)]
  
     return results_out
 
@@ -255,24 +247,20 @@ def main():
 
     rank = 0
     print('Initializing model...')
-    amr_model = create_model(config, pad_id, rank)
+    amr_prediction_model = create_model(config, pad_id, rank)
 
-    _ = load_previous_model(arguments.folder, amr_model, rank, load_previous=True)
+    _ = load_previous_model(arguments.folder, amr_prediction_model, rank, load_previous=True)
 
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    amr_model.to(device)
+    amr_prediction_model.to(device)
 
     print('Predicting AST results...')
-    cal_results_df = predict_ast_results(df_cal, config, amr_model, 100, device, vocab, pad_id)
-    eval_results_df = predict_ast_results(df_eval, config, amr_model, 100, device, vocab, pad_id)
-
-    print('Summarizing predictions...')
-    class_metrics_df = _compile_output(eval_results_df, config) 
-    class_metrics_df.to_csv(os.path.join(arguments.folder, 'eval_results.tsv'), sep='\t', index=False)
+    cal_results_df = predict_ast_results(df_cal, config, amr_prediction_model, 100, device, vocab, pad_id)
+    eval_results_df = predict_ast_results(df_eval, config, amr_prediction_model, 100, device, vocab, pad_id)
 
     print('Performing conformal prediction...')
-    conf_pred_results = conf_pred(cal_results_df, eval_results_df, config)
-    conf_pred_results.to_csv(os.path.join(arguments.folder, 'conf_pred_results.tsv'), sep='\t', index=False)
+    df_eval_cp = conf_pred(cal_results_df, eval_results_df, config)
+    df_eval_cp.to_csv(os.path.join(arguments.folder, 'eval_results.tsv'), sep='\t', index=False)
 
     print('Evaluation complete!')
 
