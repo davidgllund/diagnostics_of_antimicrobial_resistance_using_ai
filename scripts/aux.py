@@ -27,7 +27,7 @@ def separate_duplicate_class(items, classes):
     
     return extracted, remaining
 
-def expand_samples(dataset, config, isolates_per_batch, n_metadata, seed, max_expansions=5, max_predictor_antibiotics=6):
+def expand_samples(dataset, config, isolates_per_batch, n_metadata, seed, max_predictor_antibiotics=6):
     if seed is None:
         seed = random.randint(1, 10000)
 
@@ -43,26 +43,25 @@ def expand_samples(dataset, config, isolates_per_batch, n_metadata, seed, max_ex
     for isolate in sampled['sentence']:
         metadata = isolate[:n_metadata]
         antibiotics = isolate[n_metadata:]
-        antibiotic_classes = list(set([config['vocab']['ab_class'][x.split('_')[0]] for x in antibiotics]))
-        n_classes = len(antibiotic_classes)
+        
+        antibiotic_classes = {
+            ab: config['vocab']['ab_class'][ab.split('_')[0]]
+            for ab in antibiotics
+        }
+        
+        unique_classes = list(dict.fromkeys(antibiotic_classes.values()))
+        n_classes = len(unique_classes)
 
         possible_indices = list(range(n_classes))
 
-        if n_classes > max_expansions:
-            chosen_indices = np.random.choice(
-                possible_indices, size=max_expansions, replace=False
-            )
-        else:
-            chosen_indices = possible_indices
-
-        for i in chosen_indices:
+        for i in possible_indices:
             i_capped = min(i, max_predictor_antibiotics, n_classes)
 
             predictor_indices = np.sort(
                 np.random.choice(n_classes, size=i_capped, replace=False)
             )
             
-            selected_classes = [antibiotic_classes[j] for j in predictor_indices]
+            selected_classes = [unique_classes[j] for j in predictor_indices]
             selected_antibiotics = [x for x in antibiotics if config['vocab']['ab_class'][x.split('_')[0]] in selected_classes]
             selected_antibiotics = list(set(selected_antibiotics))
 
