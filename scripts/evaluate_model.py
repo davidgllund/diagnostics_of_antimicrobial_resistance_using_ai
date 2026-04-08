@@ -6,8 +6,7 @@ import pandas as pd
 from sys import argv
 import yaml
 import torch
-import pickle as pkl
-import gc
+import pickle as pkl 
 
 from model_utils import load_previous_model, create_model
 from aux import ABTextDataset, expand_samples, get_balanced_indices, to_device
@@ -84,7 +83,11 @@ def predict_ast_results(df, config, amr_prediction_model, epoch_idx, device, voc
                 targets = y_resp[mask, ab_idx]
 
                 softmax = torch.softmax(logits, dim=1)
-                preds = torch.argmax(softmax, dim=1)
+
+                sample_indices = mask.nonzero(as_tuple=False).squeeze(1)
+                batch_species_flat = [species_batch[i] for i in sample_indices]
+                batch_sample_type_flat = [sample_type_batch[i] for i in sample_indices]
+                batch_n_ast_flat = [int(x_pos[i].sum().cpu()) for i in sample_indices]
 
                 n_outputs = config['model']['n_outputs_per_antibiotic'][antibiotics[ab_idx]]
 
@@ -93,22 +96,36 @@ def predict_ast_results(df, config, amr_prediction_model, epoch_idx, device, voc
                     pR = softmax[:, 1]
                     pI = torch.zeros_like(pS) 
 
+                    if thresholds == None:
+                        preds = torch.argmax(softmax, dim=1).cpu().numpy()
+                    else:
+                        softmax_np = softmax[:, 1].detach().numpy()
+                        threshold_vals = np.array([thresholds.get((antibiotics[ab_idx], sp, n_ast), 0.5) 
+                                                for sp, n_ast in zip(batch_species_flat, batch_n_ast_flat)])
+                        preds = np.where(softmax_np >= threshold_vals, 1, 0)
+
+
                 else:
                     pS = softmax[:, 0]
                     pI = softmax[:, 1]
                     pR = softmax[:, 2]
 
-                sample_indices = mask.nonzero(as_tuple=False).squeeze(1)
-                batch_species_flat = [species_batch[i] for i in sample_indices]
-                batch_sample_type_flat = [sample_type_batch[i] for i in sample_indices]
-                batch_n_ast_flat = [int(x_pos[i].sum().cpu()) for i in sample_indices]
+                    if thresholds == None:
+                        preds = torch.argmax(softmax, dim=1).cpu().numpy()
+                    else:
+                        softmax_np = softmax[:, 2].detach().numpy()
+                        preds_max = torch.argmax(softmax, dim=1).cpu().numpy()
+                        threshold_vals = np.array([thresholds.get((antibiotics[ab_idx], sp, n_ast), 0.5) 
+                                                for sp, n_ast in zip(batch_species_flat, batch_n_ast_flat)])
+                        preds = np.where(softmax_np >= threshold_vals, 2, 0)
+                        preds = np.where((preds == 0) & (preds_max == 1), 1, preds)
 
                 all_species.extend(batch_species_flat)
                 all_sample_types.extend(batch_sample_type_flat)
                 all_n_ast.extend(batch_n_ast_flat)
                 all_antibiotics.extend([antibiotics[ab_idx]] * len(batch_species_flat))
 
-                preds_list.append(preds.cpu().numpy())
+                preds_list.append(preds)
                 trues_list.append(targets.cpu().numpy())
                 pS_list.append(pS.cpu().numpy())
                 pI_list.append(pI.cpu().numpy())
@@ -254,9 +271,18 @@ def main():
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     amr_prediction_model.to(device)
 
+    thresholds_path = config['model']['thresholds']
+    if os.path.exists(thresholds_path):
+        try:
+            with open(thresholds_path, 'rb') as f:
+                thresholds = pkl.load(f)
+        except Exception as e:
+            print(f'Warning: Failed to load thresholds from {thresholds_path}: {e}')
+            thresholds = None
+
     print('Predicting AST results...')
-    cal_results_df = predict_ast_results(df_cal, config, amr_prediction_model, 100, device, vocab, pad_id)
-    eval_results_df = predict_ast_results(df_eval, config, amr_prediction_model, 100, device, vocab, pad_id)
+    cal_results_df = predict_ast_results(df_cal, config, amr_prediction_model, 100, device, vocab, pad_id, thresholds)
+    eval_results_df = predict_ast_results(df_eval, config, amr_prediction_model, 100, device, vocab, pad_id, thresholds)
 
     print('Performing conformal prediction...')
     df_eval_cp = conf_pred(cal_results_df, eval_results_df, config)

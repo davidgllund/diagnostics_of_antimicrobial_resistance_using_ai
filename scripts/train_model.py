@@ -12,7 +12,7 @@ import gc
 from sys import argv
 
 from transformers import get_linear_schedule_with_warmup
-#from sklearn.metrics import roc_curve
+from sklearn.metrics import roc_curve
 from aux import ABTextDataset, expand_samples, get_balanced_indices, to_device, append_df_to_tsv, update_ema, print_progress, numeric_to_phenotype 
 from model_utils import create_model, load_previous_model, load_previous_state, start_optimizer_loss, save_model
 from evaluate_model import predict_ast_results
@@ -109,24 +109,27 @@ def _compute_loss(logits_list, y_pos, y_resp, criterion, train, config, antibiot
 
     return loss
     
-#def compute_classification_thresholds(df):
-#    thresholds = {}
-#    for ab, g in df.groupby(['antibiotic', 'species', 'n_ast_results']):
-#        y_true = g['true'].values
-#        y_score = g['softmax_score'].values
+def compute_classification_thresholds(df, config):
+    outputs_per_antibiotic = config['model']['n_outputs_per_antibiotic']
+    thresholds = {}
+    for ab, g in df.groupby(['antibiotic', 'species', 'n_ast_results']):
+        n_outputs = outputs_per_antibiotic[ab[0]]
+        y_score = g['pR'].values
 
-#        if len(np.unique(y_true)) < 2:
-#            thresholds[ab] = 0.5
-#            continue
+        if n_outputs == 2:
+            y_true = np.array(g['true'].replace({'S':0,'R':1}), dtype=int)
 
-#        fpr, tpr, thr = roc_curve(y_true, y_score)
+        elif n_outputs == 3:
+            y_true = np.array(g['true'].replace({'S':0,'I':0,'R':1}), dtype=int)
 
-#        dist = np.sqrt((1 - tpr)**2 + fpr**2)
-#        best_point = thr[np.argmin(dist)]
+        fpr, tpr, thr = roc_curve(y_true, y_score)
 
-#        thresholds[ab] = best_point
-    
-#    return thresholds
+        dist = np.sqrt((1 - tpr)**2 + fpr**2)
+        best_point = thr[np.argmin(dist)]
+
+        thresholds[ab] = best_point
+        
+    return thresholds
 
 def define_thresholds(pS, pR, y, n_classes, error_limit, phenotype):
     taus = np.linspace(0,1,1000)
@@ -384,7 +387,10 @@ def main():
 
     print('Computing classification thresholds...')
     val_results_df = predict_ast_results(df_val, config, amr_prediction_model, n_epochs, device, vocab, pad_id, thresholds=None)
+    thresholds = compute_classification_thresholds(val_results_df, config)
 
+    with open(config['model']['thresholds'], 'wb') as f:
+            pkl.dump(thresholds, f)
 
 if __name__ == '__main__':
     main()
