@@ -192,7 +192,7 @@ def forward_epoch(df, config, amr_prediction_model, criterion, optimizer, schedu
 
     for batch_idx, batch in enumerate(dataloader):
         start_time = time.time()
-        token_ids, year, month, age, species_batch, sample_type_batch, x_resp, x_pos, y_resp, y_pos = to_device(batch, device)
+        token_ids, year, month, age, species_batch, _, _, _, _, y_resp, y_pos = to_device(batch, device)
         
         attention_mask = torch.cat([
             torch.ones(token_ids.size(0), N_CONTINUOUS_FEATURES, device=device, dtype=torch.long),

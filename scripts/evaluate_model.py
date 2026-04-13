@@ -61,11 +61,14 @@ def predict_ast_results(df, config, amr_prediction_model, epoch_idx, device, voc
     all_species = []
     all_antibiotics = []
     all_sample_types = []
+    all_genders = []
+    all_ages = []
+    all_labs = []
     all_n_ast = []
 
     with torch.no_grad():
         for batch in dataloader:
-            token_ids, year, month, age, species_batch, sample_type_batch, _, x_pos, y_resp, y_pos = to_device(batch, device)
+            token_ids, year, month, age, species_batch, sample_type_batch, gender_batch, lab_batch, x_pos, y_resp, y_pos = to_device(batch, device)
 
             attention_mask = torch.cat([
                 torch.ones(token_ids.size(0), N_CONTINUOUS_FEATURES, device=device, dtype=torch.long),
@@ -87,6 +90,9 @@ def predict_ast_results(df, config, amr_prediction_model, epoch_idx, device, voc
                 sample_indices = mask.nonzero(as_tuple=False).squeeze(1)
                 batch_species_flat = [species_batch[i] for i in sample_indices]
                 batch_sample_type_flat = [sample_type_batch[i] for i in sample_indices]
+                batch_gender_flat = [gender_batch[i] for i in sample_indices]
+                batch_age_flat = [age[i].cpu().item() for i in sample_indices]
+                batch_lab_flat = [lab_batch[i] for i in sample_indices]
                 batch_n_ast_flat = [int(x_pos[i].sum().cpu()) for i in sample_indices]
 
                 n_outputs = config['model']['n_outputs_per_antibiotic'][antibiotics[ab_idx]]
@@ -99,7 +105,7 @@ def predict_ast_results(df, config, amr_prediction_model, epoch_idx, device, voc
                     if thresholds == None:
                         preds = torch.argmax(softmax, dim=1).cpu().numpy()
                     else:
-                        softmax_np = softmax[:, 1].detach().numpy()
+                        softmax_np = softmax[:, 1].cpu().numpy()
                         threshold_vals = np.array([thresholds.get((antibiotics[ab_idx], sp, n_ast), 0.5) 
                                                 for sp, n_ast in zip(batch_species_flat, batch_n_ast_flat)])
                         preds = np.where(softmax_np >= threshold_vals, 1, 0)
@@ -113,7 +119,7 @@ def predict_ast_results(df, config, amr_prediction_model, epoch_idx, device, voc
                     if thresholds == None:
                         preds = torch.argmax(softmax, dim=1).cpu().numpy()
                     else:
-                        softmax_np = softmax[:, 2].detach().numpy()
+                        softmax_np = softmax[:, 2].cpu().numpy()
                         preds_max = torch.argmax(softmax, dim=1).cpu().numpy()
                         threshold_vals = np.array([thresholds.get((antibiotics[ab_idx], sp, n_ast), 0.5) 
                                                 for sp, n_ast in zip(batch_species_flat, batch_n_ast_flat)])
@@ -122,6 +128,9 @@ def predict_ast_results(df, config, amr_prediction_model, epoch_idx, device, voc
 
                 all_species.extend(batch_species_flat)
                 all_sample_types.extend(batch_sample_type_flat)
+                all_genders.extend(batch_gender_flat)
+                all_ages.extend(batch_age_flat)
+                all_labs.extend(batch_lab_flat)
                 all_n_ast.extend(batch_n_ast_flat)
                 all_antibiotics.extend([antibiotics[ab_idx]] * len(batch_species_flat))
 
@@ -146,6 +155,9 @@ def predict_ast_results(df, config, amr_prediction_model, epoch_idx, device, voc
 
     # Collect predictions
     results_df = pd.DataFrame({
+        "lab": all_labs,
+        "age": all_ages,
+        "gender": all_genders,
         "species": all_species,
         "antibiotic": all_antibiotics,
         "sample_type": all_sample_types,

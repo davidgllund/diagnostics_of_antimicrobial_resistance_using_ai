@@ -182,6 +182,8 @@ class ABTextDataset(Dataset):
         self.encode_response_list  = list(encode_response.keys())
         self.species = [x[6] for x in X]
         self.sample_type = [x[7] for x in X]
+        self.gender = [x[5] for x in X]
+        self.lab = [x[4] for x in X]
 
         self.response_to_ab_idx = {}
         for response_key in self.encode_response_list:
@@ -211,7 +213,6 @@ class ABTextDataset(Dataset):
 
         del token_x[1:4] 
 
-        x_resp = torch.zeros(len(self.antibiotics), dtype=torch.long)
         x_pos = torch.zeros(len(self.antibiotics), dtype=torch.long)
         
         for ast in token_x:
@@ -219,7 +220,6 @@ class ABTextDataset(Dataset):
                 ab_name = ast.split('_')[0]
                 if ab_name in self.antibiotics:
                     ab_idx = self.antibiotics.index(ab_name) 
-                    x_resp[ab_idx] = self.encode_response[ast]
                     x_pos[ab_idx] = 1
 
         y_resp = torch.zeros(len(self.antibiotics), dtype=torch.long)
@@ -238,8 +238,10 @@ class ABTextDataset(Dataset):
 
         species = self.species[idx]
         sample_type = self.sample_type[idx]
+        gender = self.gender[idx]
+        lab = self.lab[idx]
 
-        return token_x, year, month, age, species, sample_type, x_resp, x_pos, y_resp, y_pos
+        return token_x, year, month, age, species, sample_type, gender, lab, x_pos, y_resp, y_pos
     
 class Vocab:
     """
