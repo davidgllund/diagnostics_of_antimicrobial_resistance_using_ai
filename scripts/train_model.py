@@ -25,49 +25,35 @@ def parse_args(argv):
     parser.add_argument('--folder', '-f', required=True, help='Config/output folder.')
     return parser.parse_args()
 
-def _apply_regularization(logits, antibiotic_indices, words, classes, lambda_reg, device):
-    wrd_to_class = [classes.get(wrd, 'unknown') for wrd in words]
+def _apply_regularization(logits, class_ids, lambda_reg, device):
+    if logits.size(0) <= 1:
+        return torch.tensor(0.0, device=device)
 
-    class_to_idxs = {}
-    for i, cls in enumerate(wrd_to_class):
-        class_to_idxs.setdefault(cls, []).append(i)
+    n_classes = class_ids.max() + 1
+    sum_logits = torch.zeros(n_classes, logits.size(1), device=device)
+    sum_logits.index_add_(0, class_ids, logits)
+    
+    counts = torch.bincount(class_ids, minlength=n_classes).clamp(min=1).unsqueeze(1)
+    class_means = sum_logits / counts
+    
+    means_per_logit = class_means[class_ids]
+    reg_loss = torch.mean((logits - means_per_logit) ** 2)
+    
+    return lambda_reg * reg_loss
 
-    class_means = {}
-    for cls, idxs in class_to_idxs.items():
-        if len(idxs) < 2:
-            continue
-
-        mask_cls = torch.isin(antibiotic_indices, torch.tensor(idxs, device=device))
-        class_logits = logits[mask_cls]
-        if class_logits.size(0) > 0:
-            class_means[cls] = class_logits.mean(dim=0)
-
-    reg_loss = torch.tensor(0.0, device=device)
-    for cls, idxs in class_to_idxs.items():
-        if cls not in class_means:
-            continue
-
-        for i in idxs:
-            wrd_mask = (antibiotic_indices == i)
-            if wrd_mask.sum() == 0:
-                continue
-
-            wrd_logits = logits[wrd_mask]
-            reg_loss += ((wrd_logits - class_means[cls]) ** 2).mean()
-
-    reg_loss = lambda_reg * reg_loss
-    return reg_loss
 
 def _compute_loss(logits_list, y_pos, y_resp, criterion, train, config, antibiotics, species, device):
-    loss_total = torch.tensor(0.0, device=device)
+    loss_total = 0.0
     n_total = 0
+    
+    reg_loss_class = torch.tensor(0.0, device=device)
+    reg_loss_grp = torch.tensor(0.0, device=device)
 
-    lambda_class_reg = config['train'].get('lambda_class_reg', 0.0)
-    lambda_grp_reg = config['train'].get('lambda_grp_reg', 0.0)
-
-    ab_classes = config['vocab'].get('ab_class', {})
+    lambda_class = config['train'].get('lambda_class_reg', 0.0)
+    lambda_grp = config['train'].get('lambda_grp_reg', 0.0)
+    
     sp_grps = config['vocab'].get('sp_grp', {})
-    species_to_group = {sp: grp for grp, species_list in sp_grps.items() for sp in species_list}
+    species_to_idx = {sp: i for i, (grp, list_sp) in enumerate(sp_grps.items()) for sp in list_sp}
 
     for ab_idx, (ab_name, logits_ab) in enumerate(zip(antibiotics, logits_list)):
         mask = y_pos[:, ab_idx] == 1
@@ -75,39 +61,31 @@ def _compute_loss(logits_list, y_pos, y_resp, criterion, train, config, antibiot
             continue
 
         logits = logits_ab[mask]
-        targets_ab = y_resp[mask, ab_idx] 
-        species_ab = np.array(species)[mask.cpu().numpy()]
-
-        crit = criterion[ab_name]
-        sample_losses = crit(logits, targets_ab)
-
-        loss_total += sample_losses.sum()
-        n_total += sample_losses.numel()
+        targets = y_resp[mask, ab_idx]
+        
+        loss_total += criterion[ab_name](logits, targets).sum()
+        n_total += targets.numel()
 
         if train:
-            antibiotic_indices = torch.full(
-                (logits.size(0),),
-                ab_idx,
-                dtype=torch.long,
-                device=device
-            )
+            if lambda_class > 0:
+                class_ids = torch.zeros(logits.size(0), dtype=torch.long, device=device)
+                reg_loss_class += _apply_regularization(logits, class_ids, lambda_class, device)
 
-            if lambda_class_reg > 0:
-                loss_total += lambda_class_reg * _apply_regularization(logits, antibiotic_indices,
-                                                                       [ab_name] * logits.size(0),
-                                                                       ab_classes, 1.0, device)
-
-            if lambda_grp_reg > 0:
-                loss_total += lambda_grp_reg * _apply_regularization(logits, antibiotic_indices,
-                                                                     species_ab, species_to_group, 
-                                                                     1.0, device)
+            if lambda_grp > 0:
+                current_species = np.array(species)[mask.cpu().numpy()]
+                grp_ids = torch.tensor([species_to_idx.get(s, -1) for s in current_species], 
+                                     device=device, dtype=torch.long)
                 
+                valid_mask = grp_ids != -1
+                if valid_mask.any():
+                    reg_loss_grp += _apply_regularization(logits[valid_mask], 
+                                                          grp_ids[valid_mask], 
+                                                          lambda_grp, device)
+
     if n_total == 0:
-        return None, None
+        return None
 
-    loss = loss_total / n_total
-
-    return loss
+    return (loss_total / n_total) + reg_loss_class + reg_loss_grp
     
 def compute_classification_thresholds(df, config):
     outputs_per_antibiotic = config['model']['n_outputs_per_antibiotic']
@@ -170,7 +148,7 @@ def forward_epoch(df, config, amr_prediction_model, criterion, optimizer, schedu
     pin_memory = torch.cuda.is_available()
     persistent_workers = num_workers > 0
      
-    x, y = expand_samples(df, config, isolates_per_batch, n_metadata, epoch_idx)
+    x, y = expand_samples(df, config, isolates_per_batch, n_metadata, epoch_idx, 6, train)
     idx = get_balanced_indices(x, y, obs_per_epoch)
 
     x = [x[j] for j in idx]
