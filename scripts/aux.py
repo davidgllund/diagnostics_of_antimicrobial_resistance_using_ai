@@ -27,7 +27,7 @@ def separate_duplicate_class(items, classes):
     
     return extracted, remaining
 
-def expand_samples(dataset, config, isolates_per_batch, n_metadata, seed, max_predictor_antibiotics=6):
+def expand_samples(dataset, config, isolates_per_batch, n_metadata, seed, max_predictor_antibiotics=6, train=True):
     if seed is None:
         seed = random.randint(1, 10000)
 
@@ -41,6 +41,15 @@ def expand_samples(dataset, config, isolates_per_batch, n_metadata, seed, max_pr
     all_responses = []
 
     for isolate in sampled['sentence']:
+        if train:
+            phenotypes = [x.split('_')[1] for x in isolate[7:]]
+            resistance_rate = sum([x == "R" for x in phenotypes]) / len(phenotypes)
+
+            if resistance_rate == 0:
+                chance = random.randrange(1,100)
+                if chance <= 90:
+                    continue
+
         metadata = isolate[:n_metadata]
         antibiotics = isolate[n_metadata:]
         

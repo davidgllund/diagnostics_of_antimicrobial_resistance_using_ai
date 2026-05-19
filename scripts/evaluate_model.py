@@ -39,7 +39,7 @@ def predict_ast_results(df, config, amr_prediction_model, epoch_idx, device, voc
     pin_memory = torch.cuda.is_available()
     persistent_workers = num_workers > 0
 
-    x, y = expand_samples(df, config, isolates_per_batch, n_metadata, epoch_idx)
+    x, y = expand_samples(df, config, isolates_per_batch, n_metadata, epoch_idx, 6, False)
     idx = get_balanced_indices(x, y, obs_per_epoch)
 
     x = [x[j] for j in idx]
