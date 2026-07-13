@@ -19,102 +19,77 @@ def create_model(config, pad_id, rank=0):
         n_heads=model_cfg['n_heads'],
         encoder_stack_depth=model_cfg['encoder_stack_depth'],
         ffn_dimension=model_cfg['ffn_dimension'],
-        max_seq_len=model_cfg['max_seq_len'],
+        max_n_tokens=model_cfg['max_n_tokens'],
         vocab_size=vocab_cfg['vocab_size'],
         pad_id=pad_id,
         dropout_rate_attn=model_cfg['dropout_rate_attn'],
         n_outputs_per_antibiotic=model_cfg['n_outputs_per_antibiotic']
     )
-    print(f'Model parameters: {sum(p.numel() for p in amr_prediction_model.parameters() if p.requires_grad):,}')
+
+    if rank == 0:
+        print(f'Model parameters: {sum(p.numel() for p in amr_prediction_model.parameters() if p.requires_grad):,}')
+
     return amr_prediction_model
 
-def load_previous_model(model_folder, amr_prediction_model, rank=0, load_previous=True):
-    def log(msg: str):
+
+def load_previous_training_state(model_folder, amr_prediction_model, n_epochs, rank=0):
+    def log(msg):
         if rank == 0:
             print(msg)
 
-    log('Loading previous model (?)')
-    if not load_previous:
-        log('No')
-        return None   
-    log('Yes')
+    defaults = dict(start_epoch=0, min_val_loss=float('inf'), avg_batch_time=0.0, total_elapsed_time=0.0, processed_batches=0)
 
-    model_path = os.path.join(model_folder, 'pretrain_amr_prediction_model.torch')
-    state_path = os.path.join(model_folder, 'pretrain_state.pkl')
-
-    state = None
+    model_path = os.path.join(model_folder, 'amr_prediction_model.torch')
+    state_path = os.path.join(model_folder, 'training_state.pkl')
+    train_log = os.path.join(model_folder, 'avg_train_performance.tsv')
+    val_log = os.path.join(model_folder, 'avg_val_performance.tsv')
 
     if os.path.exists(model_path):
         try:
-            log('Loading previous model weights...')
             map_loc = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
-            state_dict = torch.load(model_path, map_location=map_loc)
-            amr_prediction_model.load_state_dict(state_dict)
+            amr_prediction_model.load_state_dict(
+                torch.load(model_path, map_location=map_loc, weights_only=True)
+            )
+            log('Model weights loaded successfully')
         except Exception as e:
             log(f'Warning: Failed to load model weights: {e}')
+    else:
+        log('No previous model found, starting from random init')
 
+    pkl_state = {}
     if os.path.exists(state_path):
         try:
-            log('Loading previous state...')
             with open(state_path, 'rb') as f:
-                state = pkl.load(f)
+                pkl_state = pkl.load(f)
+            log('Training state loaded successfully')
         except Exception as e:
-            log(f'Warning: Failed to load state: {e}')
-    else:
-        log('No previous state found.')
+            log(f'Warning: Failed to load training state: {e}')
 
+    tsv_state = {}
+    if os.path.exists(train_log) and os.path.exists(val_log):
+        try:
+            df_train_log = pd.read_csv(train_log, sep='\t')
+            df_val_log = pd.read_csv(val_log, sep='\t')
+
+            if not df_train_log.empty and not df_val_log.empty:
+                last_epoch = int(min(df_train_log['epoch'].max(), df_val_log['epoch'].max()))
+                start_epoch = last_epoch + 1
+
+            if start_epoch >= n_epochs:
+                log(f'Training already completed ({start_epoch} epochs logged, n_epochs={n_epochs}).')
+                start_epoch = n_epochs
+
+            min_val_loss = float(df_val_log['avg_loss'].min())
+            tsv_state = dict(start_epoch=start_epoch, min_val_loss=min_val_loss)
+            log(f'Resuming from epoch {start_epoch} (min val loss so far: {min_val_loss:.4f}).')
+        except Exception as e:
+             log(f'Warning: Failed to read log files: {e}')
+    else:
+        log('No previous log files found, starting from scratch')
+
+    state = {**defaults, **pkl_state, **tsv_state}
     return state
 
-def load_previous_state(model_folder, n_epochs, rank=0):
-    if rank == 0:
-        print('Checking for previous state...')
-
-    train_results_path = os.path.join(model_folder, 'avg_train_performance.tsv')
-    val_results_path = os.path.join(model_folder, 'avg_val_performance.tsv')
-
-    train_loss = torch.zeros((n_epochs, 1))
-    val_loss = torch.zeros((n_epochs, 1))
-
-    start_epoch = 0
-    min_val_loss = 1000
-    avg_batch_time = 0
-    total_time = 0
-    processed_batches = 0
-
-    if not os.path.exists(train_results_path) or not os.path.exists(val_results_path):
-        if rank == 0:
-            print('No previous logs found. Starting from scratch.')
-        return train_loss, val_loss, start_epoch, avg_batch_time, total_time, processed_batches, min_val_loss
-    
-    df_train_log = pd.read_csv(train_results_path, sep="\t")
-    df_val_log   = pd.read_csv(val_results_path, sep="\t")
-
-    if df_train_log.empty or df_val_log.empty:
-        if rank == 0:
-            print('Log files empty. Starting from scratch.')
-        return train_loss, val_loss, start_epoch, avg_batch_time, total_time, processed_batches, min_val_loss
-    
-    last_train_epoch = df_train_log['epoch'].max()
-    last_val_epoch = df_val_log['epoch'].max()
-    last_epoch = min(last_train_epoch, last_val_epoch)
-
-    for e in range(last_epoch + 1):
-        g_train = df_train_log[df_train_log['epoch'] == e]
-        g_val   = df_val_log[df_val_log['epoch'] == e]
-
-        if not g_train.empty:
-            train_loss[e] = g_train['avg_loss'].mean()
-
-        if not g_val.empty:
-            val_loss[e] = g_val['avg_loss'].mean()
-
-    min_val_loss = float(val_loss[: last_epoch + 1].min())
-
-    if rank == 0:
-        print(f'Resuming training from epoch {last_epoch + 1} (min val loss: {min_val_loss:.4f})')
-
-    start_epoch = last_epoch + 1
-    return train_loss, val_loss, start_epoch, avg_batch_time, total_time, processed_batches, min_val_loss
 
 def start_optimizer_loss(config, amr_prediction_model, rank=0):
     if rank == 0:
@@ -128,11 +103,12 @@ def start_optimizer_loss(config, amr_prediction_model, rank=0):
 
     criterion = {}
     for ab in antibiotics:
-        criterion[ab] = nn.CrossEntropyLoss(reduction='none')
+        criterion[ab] = nn.CrossEntropyLoss(reduction='none', label_smoothing=0.1)
 
     optimizer = optim.Adam(params=amr_prediction_model.parameters(), lr=train_cfg['learning_rate'])
     
     return criterion, optimizer
+
 
 def save_model(path, model):
     try:

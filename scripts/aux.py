@@ -9,6 +9,97 @@ import time
 from collections import defaultdict, Counter
 from torch.utils.data import Dataset
 
+class ABTextDataset(Dataset):
+    def __init__(self, X, Y, vocab, antibiotics, max_n_tokens, encode_response):
+        self.vocab = vocab
+        self.df = pd.DataFrame({'x': X, 'y': Y})
+        self.antibiotics = antibiotics
+        self.max_n_tokens = max_n_tokens
+        self.encode_response = encode_response
+        self.encode_response_list  = list(encode_response.keys())
+        self.species = [x[6] for x in X]
+        self.sample_type = [x[7] for x in X]
+        self.gender = [x[5] for x in X]
+        self.lab = [x[4] for x in X]
+
+        self.response_to_ab_idx = {}
+        for response_key in self.encode_response_list:
+            ab_name = response_key.split('_')[0]
+            if ab_name in self.antibiotics:
+                ab_idx = self.antibiotics.index(ab_name)
+                self.response_to_ab_idx[response_key] = ab_idx
+
+    def __len__(self):
+        return len(self.df)
+    
+    def __getitem__(self, idx):
+        token_x = list(self.df.iloc[idx].x)
+        token_y = self.df.iloc[idx].y
+
+        year = torch.tensor([int(token_x[1])], dtype=torch.float32)
+        month = torch.tensor([int(token_x[2])], dtype=torch.float32)
+        age = torch.tensor([int(token_x[3])], dtype=torch.float32)
+
+        del token_x[1:4] 
+
+        x_pos = torch.zeros(len(self.antibiotics), dtype=torch.long)
+        
+        for ast in token_x:
+            if ast in self.encode_response:
+                ab_name = ast.split('_')[0]
+                if ab_name in self.antibiotics:
+                    ab_idx = self.antibiotics.index(ab_name) 
+                    x_pos[ab_idx] = 1
+
+        y_resp = torch.zeros(len(self.antibiotics), dtype=torch.long)
+        y_pos = torch.zeros(len(self.antibiotics), dtype=torch.long)
+        
+        for ast in token_y:
+            if ast in self.encode_response:
+                ab_name = ast.split('_')[0]
+                if ab_name in self.antibiotics:
+                    ab_idx = self.antibiotics.index(ab_name) 
+                    y_resp[ab_idx] = self.encode_response[ast]
+                    y_pos[ab_idx] = 1
+
+        token_x = token_x + ['<pad>'] * (self.max_n_tokens - len(token_x))
+        token_x = torch.tensor(self.vocab[token_x], dtype=torch.int64)
+
+        species = self.species[idx]
+        sample_type = self.sample_type[idx]
+        gender = self.gender[idx]
+        lab = self.lab[idx]
+
+        return token_x, year, month, age, species, sample_type, gender, lab, x_pos, y_resp, y_pos
+    
+class Vocab:
+    def __init__(self, tokens=[], min_freq=0, reserved_tokens=[]):
+        if tokens and isinstance(tokens[0], list):
+            tokens = [token for line in tokens for token in line]
+
+        counter = Counter(tokens)
+        self.token_freqs = sorted(counter.items(), key=lambda x: x[1], reverse=True)
+
+        self.idx_to_token = list(sorted(set(['<unk>'] + reserved_tokens + [
+            token for token, freq in self.token_freqs if freq >= min_freq])))
+        
+        self.token_to_idx = {token: idx for idx, token in enumerate(self.idx_to_token)}
+
+    def __len__(self):
+        return len(self.idx_to_token)
+        
+    def __getitem__(self, tokens):
+        if not isinstance(tokens, (list, tuple)):
+            return self.token_to_idx.get(tokens, self.token_to_idx['<unk>'])
+        
+        return [self.__getitem__(token) for token in tokens]
+        
+    def to_tokens(self, indices):
+        if hasattr(indices, '__len__') and len(indices) > 1:
+            return [self.idx_to_token[int(index)] for index in indices]
+        
+        return self.idx_to_token[indices]
+
 def separate_duplicate_class(items, classes):
     counts = Counter(classes)
 
@@ -27,13 +118,11 @@ def separate_duplicate_class(items, classes):
     
     return extracted, remaining
 
-def expand_samples(dataset, config, isolates_per_batch, n_metadata, seed, max_predictor_antibiotics=6, train=True):
+def expand_samples_train(dataset, isolates_per_batch, n_metadata, seed, max_predictor_antibiotics=6, samples_per_k=1):
     if seed is None:
         seed = random.randint(1, 10000)
 
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    random.seed(seed)
+    local_rng = random.Random(seed)
 
     sampled = dataset.sample(n=isolates_per_batch, random_state=seed)
 
@@ -41,15 +130,44 @@ def expand_samples(dataset, config, isolates_per_batch, n_metadata, seed, max_pr
     all_responses = []
 
     for isolate in sampled['sentence']:
-        if train:
-            phenotypes = [x.split('_')[1] for x in isolate[7:]]
-            resistance_rate = sum([x == "R" for x in phenotypes]) / len(phenotypes)
+        phenotypes = [x.split('_')[1] for x in isolate[7:]]
+        resistance_rate = sum([x == "R" for x in phenotypes]) / len(phenotypes)
 
-            if resistance_rate == 0:
-                chance = random.randrange(1,100)
-                if chance <= 90:
-                    continue
+        if resistance_rate == 0 and local_rng.random() >= 0.75:
+            continue
 
+        metadata = isolate[:n_metadata]
+        antibiotics = isolate[n_metadata:]
+
+        n_abx = len(antibiotics)
+        max_k = min(max_predictor_antibiotics, n_abx)
+
+        for k in range(max_k + 1):
+            for _ in range(samples_per_k):
+                selected_antibiotics = local_rng.sample(antibiotics, k)
+                predictor_set = set(selected_antibiotics)
+                response = [abx for abx in antibiotics if abx not in predictor_set]
+
+                predictors = ['<cls>', *metadata, *selected_antibiotics]
+
+                all_predictors.append(predictors)
+                all_responses.append(response)
+
+    return all_predictors, all_responses
+
+def expand_samples_eval(dataset, config, isolates_per_batch, n_metadata, seed, max_predictor_antibiotics=6):
+    if seed is None:
+        seed = random.randint(1, 10000)
+
+    local_rng = random.Random(seed)
+    local_np = np.random.default_rng(seed)
+
+    sampled = dataset.sample(n=isolates_per_batch, random_state=seed)
+
+    all_predictors = []
+    all_responses = []
+
+    for isolate in sampled['sentence']:
         metadata = isolate[:n_metadata]
         antibiotics = isolate[n_metadata:]
         
@@ -67,7 +185,7 @@ def expand_samples(dataset, config, isolates_per_batch, n_metadata, seed, max_pr
             i_capped = min(i, max_predictor_antibiotics, n_classes)
 
             predictor_indices = np.sort(
-                np.random.choice(n_classes, size=i_capped, replace=False)
+                local_np.choice(n_classes, size=i_capped, replace=False)
             )
             
             selected_classes = [unique_classes[j] for j in predictor_indices]
@@ -77,16 +195,19 @@ def expand_samples(dataset, config, isolates_per_batch, n_metadata, seed, max_pr
             predictor_set = set(selected_antibiotics)
             response = [abx for abx in antibiotics if abx not in predictor_set]
             
-            chance = random.randrange(1,100)
-            if chance <= 25:
+            if local_rng.random() < 0.25:
                 extracted, remaining = separate_duplicate_class(response, [config['vocab']['ab_class'][x.split('_')[0]] for x in response])
                 selected_antibiotics = [*selected_antibiotics, *extracted]
                 response = remaining
 
             if len(selected_antibiotics) > max_predictor_antibiotics:
-                selected_antibiotics = np.random.choice(
-                    selected_antibiotics, size=max_predictor_antibiotics, replace=False
-                ).tolist()
+                selected_antibiotics = [
+                    str(s) for s in local_np.choice(
+                        selected_antibiotics,
+                        size=max_predictor_antibiotics,
+                        replace=False,
+                    )
+                ]
 
             predictors = ['<cls>', *metadata, *selected_antibiotics]
 
@@ -97,6 +218,7 @@ def expand_samples(dataset, config, isolates_per_batch, n_metadata, seed, max_pr
                 break
 
     return all_predictors, all_responses
+
 
 def get_balanced_indices(x, y, obs_per_epoch):
     length_buckets = defaultdict(list)
@@ -130,7 +252,10 @@ def get_balanced_indices(x, y, obs_per_epoch):
         filler = np.random.choice(remaining_pool, size=needed, replace=False)
         selected_indices.extend(filler.tolist())
 
+    np.random.shuffle(selected_indices)
+
     return selected_indices
+
 
 def to_device(batch, device):
     res = []
@@ -142,15 +267,18 @@ def to_device(batch, device):
 
     return tuple(res)
 
+
 def append_df_to_tsv(path, df, sep='\t'):
     write_header = not os.path.exists(path)
     df.to_csv(path, mode='a', sep=sep, header=write_header, index=False)
+
 
 def update_ema(ema, value, alpha=0.05):
     if ema is None:
         return value
     
     return (1 - alpha) * ema + alpha * value
+
 
 def print_progress(epoch, step_in_epoch, batches_per_epoch,
                    processed_batches_global, total_training_batches,
@@ -170,6 +298,7 @@ def print_progress(epoch, step_in_epoch, batches_per_epoch,
         end=""
     )
 
+
 def numeric_to_phenotype(y_numeric, n_classes):
     if n_classes == 2:
         phenotype_map = {0: 'S', 1: 'R'}
@@ -177,117 +306,3 @@ def numeric_to_phenotype(y_numeric, n_classes):
         phenotype_map = {0: 'S', 1: 'I', 2: 'R'}
     
     return np.array([phenotype_map[int(y)] for y in y_numeric])
-
-class ABTextDataset(Dataset):
-    """
-    Custom Dataset for predictor-response sequences for antibiotic prediction.
-    """
-    def __init__(self, X, Y, vocab, antibiotics, max_seq_len, encode_response):
-        self.vocab = vocab
-        self.df = pd.DataFrame({'x': X, 'y': Y})
-        self.antibiotics = antibiotics
-        self.max_seq_len = max_seq_len
-        self.encode_response = encode_response
-        self.encode_response_list  = list(encode_response.keys())
-        self.species = [x[6] for x in X]
-        self.sample_type = [x[7] for x in X]
-        self.gender = [x[5] for x in X]
-        self.lab = [x[4] for x in X]
-
-        self.response_to_ab_idx = {}
-        for response_key in self.encode_response_list:
-            ab_name = response_key.split('_')[0]
-            if ab_name in self.antibiotics:
-                ab_idx = self.antibiotics.index(ab_name)
-                self.response_to_ab_idx[response_key] = ab_idx
-
-    def __len__(self):
-        """Number of samples in the dataset."""
-        return len(self.df)
-    
-    def __getitem__(self, idx):
-        """
-        Returns a single sample with all relevant tensors:
-        - token indices
-        - position indices
-        - predictor/response masks
-        - sequence lengths
-        """
-        token_x = self.df.iloc[idx].x
-        token_y = self.df.iloc[idx].y
-
-        year = torch.tensor([int(token_x[1])], dtype=torch.float32)
-        month = torch.tensor([int(token_x[2])], dtype=torch.float32)
-        age = torch.tensor([int(token_x[3])], dtype=torch.float32)
-
-        del token_x[1:4] 
-
-        x_pos = torch.zeros(len(self.antibiotics), dtype=torch.long)
-        
-        for ast in token_x:
-            if ast in self.encode_response:
-                ab_name = ast.split('_')[0]
-                if ab_name in self.antibiotics:
-                    ab_idx = self.antibiotics.index(ab_name) 
-                    x_pos[ab_idx] = 1
-
-        y_resp = torch.zeros(len(self.antibiotics), dtype=torch.long)
-        y_pos = torch.zeros(len(self.antibiotics), dtype=torch.long)
-        
-        for ast in token_y:
-            if ast in self.encode_response:
-                ab_name = ast.split('_')[0]
-                if ab_name in self.antibiotics:
-                    ab_idx = self.antibiotics.index(ab_name) 
-                    y_resp[ab_idx] = self.encode_response[ast]
-                    y_pos[ab_idx] = 1
-
-        token_x = token_x + ['<pad>'] * (self.max_seq_len - len(token_x))
-        token_x = torch.tensor(self.vocab[token_x], dtype=torch.int64)
-
-        species = self.species[idx]
-        sample_type = self.sample_type[idx]
-        gender = self.gender[idx]
-        lab = self.lab[idx]
-
-        return token_x, year, month, age, species, sample_type, gender, lab, x_pos, y_resp, y_pos
-    
-class Vocab:
-    """
-    Maps tokens to integer indices and vice versa.
-    """
-    def __init__(self, tokens=[], min_freq=0, reserved_tokens=[]):
-        if tokens and isinstance(tokens[0], list):
-            tokens = [token for line in tokens for token in line]
-
-        counter = Counter(tokens)
-        self.token_freqs = sorted(counter.items(), key=lambda x: x[1], reverse=True)
-
-        self.idx_to_token = list(sorted(set(['<unk>'] + reserved_tokens + [
-            token for token, freq in self.token_freqs if freq >= min_freq])))
-        
-        self.token_to_idx = {token: idx for idx, token in enumerate(self.idx_to_token)}
-
-    def __len__(self):
-        """Returns the size of the vocabulary."""
-        return len(self.idx_to_token)
-        
-    def __getitem__(self, tokens):
-        """Returns indices for given token(s)."""
-        if not isinstance(tokens, (list, tuple)):
-            return self.token_to_idx.get(tokens, self.unk)
-        
-        return [self.__getitem__(token) for token in tokens]
-        
-    def to_tokens(self, indices):
-        """Converts indices back to tokens."""
-        if hasattr(indices, '__len__') and len(indices) > 1:
-            return [self.idx_to_token[int(index)] for index in indices]
-        
-        return self.idx_to_token[indices]
-        
-    @property
-    def unk(self):
-        """Index of unknown token <unk>."""
-        return self.token_to_idx['<unk>']
-    

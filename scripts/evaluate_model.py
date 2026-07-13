@@ -8,8 +8,8 @@ import yaml
 import torch
 import pickle as pkl 
 
-from model_utils import load_previous_model, create_model
-from aux import ABTextDataset, expand_samples, get_balanced_indices, to_device
+from model_utils import load_previous_training_state, create_model
+from aux import ABTextDataset, expand_samples_eval, get_balanced_indices, to_device
 
 N_CONTINUOUS_FEATURES = 3 
 
@@ -22,11 +22,12 @@ def parse_args(argv):
 
     return arguments
 
+
 def predict_ast_results(df, config, amr_prediction_model, epoch_idx, device, vocab, pad_id, thresholds=None):
     model_cfg = config['model']
     data_cfg = config['test']
 
-    max_seq_len = model_cfg['max_seq_len']
+    max_n_tokens = model_cfg['max_n_tokens']
     batch_size = data_cfg['batch_size']
     obs_per_epoch = data_cfg['obs_per_epoch']
     isolates_per_batch = data_cfg['isolates_to_sample_per_batch']
@@ -39,13 +40,13 @@ def predict_ast_results(df, config, amr_prediction_model, epoch_idx, device, voc
     pin_memory = torch.cuda.is_available()
     persistent_workers = num_workers > 0
 
-    x, y = expand_samples(df, config, isolates_per_batch, n_metadata, epoch_idx, 6, False)
+    x, y = expand_samples_eval(df, config, isolates_per_batch, n_metadata, epoch_idx, 6)
     idx = get_balanced_indices(x, y, obs_per_epoch)
 
     x = [x[j] for j in idx]
     y = [y[j] for j in idx]
 
-    dataset = ABTextDataset(x, y, vocab, antibiotics, max_seq_len, encode_response)
+    dataset = ABTextDataset(x, y, vocab, antibiotics, max_n_tokens, encode_response)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size, shuffle=False, num_workers=num_workers, 
                                              pin_memory=pin_memory, persistent_workers=persistent_workers)
     
@@ -70,10 +71,7 @@ def predict_ast_results(df, config, amr_prediction_model, epoch_idx, device, voc
         for batch in dataloader:
             token_ids, year, month, age, species_batch, sample_type_batch, gender_batch, lab_batch, x_pos, y_resp, y_pos = to_device(batch, device)
 
-            attention_mask = torch.cat([
-                torch.ones(token_ids.size(0), N_CONTINUOUS_FEATURES, device=device, dtype=torch.long),
-                (token_ids != pad_id).long()
-            ], dim=1)
+            attention_mask = (token_ids != pad_id).long()
 
             logits_list = amr_prediction_model(token_ids, year, month, age, attention_mask)
 
@@ -184,6 +182,7 @@ def predict_ast_results(df, config, amr_prediction_model, epoch_idx, device, voc
 
     return results_df
 
+
 def conf_pred(cal_results, eval_results, config):  
     min_group_size = 100 
     cal_results = cal_results.copy()
@@ -259,6 +258,7 @@ def conf_pred(cal_results, eval_results, config):
  
     return results_out
 
+
 def main():
     arguments = parse_args(argv)
     with open(os.path.join(arguments.folder, arguments.config), 'r') as f:
@@ -278,7 +278,8 @@ def main():
     print('Initializing model...')
     amr_prediction_model = create_model(config, pad_id, rank)
 
-    _ = load_previous_model(arguments.folder, amr_prediction_model, rank, load_previous=True)
+    n_epochs = config['train']['n_epochs']
+    _ = load_previous_training_state(arguments.folder, amr_prediction_model, n_epochs, rank)
 
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     amr_prediction_model.to(device)

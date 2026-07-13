@@ -112,7 +112,7 @@ def filter_ab_sp_combinations(df):
         .reset_index(name='Freq')
     )
 
-    top_sp = top_sp[top_sp['Freq'] > 10000]
+    top_sp = top_sp[top_sp['Freq'] >= 10000]
     df = df.loc[df['pathogen'].isin(top_sp['pathogen'])]
 
     # Extract antibiotic-species combinations with sufficient data
@@ -148,6 +148,18 @@ def filter_ab_sp_combinations(df):
         ~((df['sir'] == 'I') & 
         (~df[['pathogen', 'antibiotic']].apply(tuple, axis=1).isin(valid_i_pairs)))
     ]
+
+    # Keep only species where at least 5 antibitoics have passed the criteria above
+    final_sp = (
+        df[['pathogen', 'antibiotic']]
+        .drop_duplicates()
+        .groupby('pathogen')
+        .size()
+        .reset_index(name='Freq')
+    )
+
+    final_sp = final_sp[final_sp['Freq'] >= 5]
+    df = df.loc[df['pathogen'].isin(final_sp['pathogen'])]
 
     return df
 
