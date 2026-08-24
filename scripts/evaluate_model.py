@@ -183,7 +183,7 @@ def predict_ast_results(df, config, amr_prediction_model, epoch_idx, device, voc
     return results_df
 
 
-def conf_pred(cal_results, eval_results, config):  
+def conformal_prediction(cal_results, eval_results, config):  
     min_group_size = 100 
     cal_results = cal_results.copy()
     results_out = eval_results.copy()
@@ -298,7 +298,7 @@ def main():
     eval_results_df = predict_ast_results(df_eval, config, amr_prediction_model, 100, device, vocab, pad_id, thresholds)
 
     print('Performing conformal prediction...')
-    df_eval_cp = conf_pred(cal_results_df, eval_results_df, config)
+    df_eval_cp = conformal_prediction(cal_results_df, eval_results_df, config)
     df_eval_cp.to_csv(os.path.join(arguments.folder, 'eval_results.tsv'), sep='\t', index=False)
 
     print('Evaluation complete!')
