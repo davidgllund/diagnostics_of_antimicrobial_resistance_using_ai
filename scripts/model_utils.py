@@ -23,6 +23,7 @@ def create_model(config, pad_id, rank=0):
         vocab_size=vocab_cfg['vocab_size'],
         pad_id=pad_id,
         dropout_rate_attn=model_cfg['dropout_rate_attn'],
+        hidden_size=model_cfg['hidden_size'],
         n_outputs_per_antibiotic=model_cfg['n_outputs_per_antibiotic']
     )
 

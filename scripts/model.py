@@ -50,24 +50,20 @@ class TransformerEncoder(nn.Module):
     
 
 class AntibioticClassifier(nn.Module):
-    def __init__(self, embedding_size, n_outputs, layer_norm_eps, antibiotic):
+    def __init__(self, embedding_size, hidden_size, n_outputs, layer_norm_eps, antibiotic):
         super().__init__()
 
         self.antibiotic = antibiotic
 
         n_continuous = 3
-
-        if n_outputs == 2:
-            input_size = embedding_size + n_continuous
-        elif n_outputs == 3:
-            input_size = embedding_size + n_continuous + 1
+        input_size = embedding_size + n_continuous 
 
         self.classification_head = nn.Sequential(
-            nn.Linear(input_size, embedding_size),
+            nn.Linear(input_size, hidden_size),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.LayerNorm(embedding_size, eps=layer_norm_eps),
-            nn.Linear(embedding_size, n_outputs)
+            nn.LayerNorm(hidden_size, eps=layer_norm_eps),
+            nn.Linear(hidden_size, n_outputs)
         )
         
     def forward(self, x):
@@ -76,7 +72,7 @@ class AntibioticClassifier(nn.Module):
 
 class AMRPredictionModel(nn.Module):
     def __init__(self, embedding_size, n_antibiotics, antibiotics, layer_norm_eps, n_heads, encoder_stack_depth, 
-                 ffn_dimension, max_n_tokens, vocab_size, pad_id, dropout_rate_attn,
+                 ffn_dimension, max_n_tokens, vocab_size, pad_id, dropout_rate_attn, hidden_size,
                  n_outputs_per_antibiotic=None, **kwargs):
         
         super().__init__(**kwargs)
@@ -97,7 +93,7 @@ class AMRPredictionModel(nn.Module):
         self.n_outputs_list = [n_outputs_per_antibiotic[ab] for ab in antibiotics]
         
         self.classifiers = nn.ModuleList([
-            AntibioticClassifier(embedding_size, n_out, layer_norm_eps, ab)
+            AntibioticClassifier(embedding_size, hidden_size, n_out, layer_norm_eps, ab)
             for n_out, ab in zip(self.n_outputs_list, antibiotics)
         ])
     
