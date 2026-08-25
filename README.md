@@ -27,13 +27,34 @@ The following software is required to run the pipeline:
 - Scikit-learn >= 1.3.1
 
 ## Repository structure
-- scripts/aux.py: core helper functions for dataset construction, vocabulary handling, sample expansion, and batch preparation.
-- scripts/evaluate_model.py: performs inference on evaluation or calibration splits, generates predictions and probability estimates, and supports conformal-style thresholding.
-- scripts/model_utils.py: initializes the model architecture, optimizer and loss functions, and loads or saves training checkpoints and state.
-- scripts/model.py: defines the transformer encoder and antibiotic-specific classification heads used by the prediction model.
-- scripts/train_model.py: runs the training loop across epochs, computes training and validation metrics, and writes logs and model outputs.
+- pyproject.toml: project metadata and editable-install configuration for a proper Python package.
+- src/dire/: installable package entry points and compatibility wrappers for the training and evaluation pipeline.
+- scripts/: legacy pipeline scripts retained for compatibility with the original workflow.
 - model/config.yaml: an example model configuration file used to define architecture and training behavior.
 - data/: contains the input data and preprocessing artifacts required by the pipeline.
+
+## Python project usage
+Install the project in editable mode from the repository root:
+
+```bash
+python -m pip install -e .
+```
+
+Once installed, the project can be used through the package CLI or direct module execution:
+
+```bash
+python -m dire train --config model/config.yaml --folder ./experiments/example
+python -m dire evaluate --config model/config.yaml --folder ./experiments/example
+python -m dire process-data --input data/raw.tsv --output data/formatted.tsv --vocab data/vocab.pth
+```
+
+The following console commands are also available:
+
+```bash
+dire-train --config model/config.yaml --folder ./experiments/example
+dire-evaluate --config model/config.yaml --folder ./experiments/example
+dire-process-data --input data/raw.tsv --output data/formatted.tsv --vocab data/vocab.pth
+```
 
 ## Workflow
 A typical analysis pipeline is as follows:
