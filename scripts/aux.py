@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 import torch
-import pandas as pd
+import polars as pl
 import numpy as np
 import random
 import os
@@ -12,7 +12,7 @@ from torch.utils.data import Dataset
 class ABTextDataset(Dataset):
     def __init__(self, X, Y, vocab, antibiotics, max_n_tokens, encode_response):
         self.vocab = vocab
-        self.df = pd.DataFrame({'x': X, 'y': Y})
+        self.df = pl.DataFrame({'x': X, 'y': Y})
         self.antibiotics = antibiotics
         self.max_n_tokens = max_n_tokens
         self.encode_response = encode_response
@@ -33,8 +33,9 @@ class ABTextDataset(Dataset):
         return len(self.df)
     
     def __getitem__(self, idx):
-        token_x = list(self.df.iloc[idx].x)
-        token_y = self.df.iloc[idx].y
+        row = self.df.row(idx)
+        token_x = list(row[0])
+        token_y = row[1]
 
         year = torch.tensor([int(token_x[1])], dtype=torch.float32)
         month = torch.tensor([int(token_x[2])], dtype=torch.float32)
@@ -124,7 +125,7 @@ def expand_samples_train(dataset, isolates_per_batch, n_metadata, seed, max_pred
 
     local_rng = random.Random(seed)
 
-    sampled = dataset.sample(n=isolates_per_batch, random_state=seed)
+    sampled = dataset.sample(n=isolates_per_batch, seed=seed)
 
     all_predictors = []
     all_responses = []
@@ -144,6 +145,9 @@ def expand_samples_train(dataset, isolates_per_batch, n_metadata, seed, max_pred
 
         for k in range(max_k + 1):
             for _ in range(samples_per_k):
+                # ensure antibiotics is a sequence for random.sample
+                if not isinstance(antibiotics, (list, tuple)):
+                    antibiotics = list(antibiotics)
                 selected_antibiotics = local_rng.sample(antibiotics, k)
                 predictor_set = set(selected_antibiotics)
                 response = [abx for abx in antibiotics if abx not in predictor_set]
@@ -162,7 +166,7 @@ def expand_samples_eval(dataset, config, isolates_per_batch, n_metadata, seed, m
     local_rng = random.Random(seed)
     local_np = np.random.default_rng(seed)
 
-    sampled = dataset.sample(n=isolates_per_batch, random_state=seed)
+    sampled = dataset.sample(n=isolates_per_batch, seed=seed)
 
     all_predictors = []
     all_responses = []
@@ -270,7 +274,8 @@ def to_device(batch, device):
 
 def append_df_to_tsv(path, df, sep='\t'):
     write_header = not os.path.exists(path)
-    df.to_csv(path, mode='a', sep=sep, header=write_header, index=False)
+    with open(path, 'a', newline='') as f:
+        df.write_csv(f, separator=sep, include_header=write_header)
 
 
 def update_ema(ema, value, alpha=0.05):

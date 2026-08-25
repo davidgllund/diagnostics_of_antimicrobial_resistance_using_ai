@@ -1,0 +1,7 @@
+[console_scripts]
+dire = dire.cli:main
+dire-evaluate = dire.cli:evaluate
+dire-process-data = dire.cli:process_data
+dire-process-eval-data = dire.cli:process_eval_data
+dire-specific-predictions = dire.cli:specific_predictions
+dire-train = dire.cli:train

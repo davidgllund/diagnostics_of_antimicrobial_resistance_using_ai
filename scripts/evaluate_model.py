@@ -2,14 +2,14 @@
 import os
 import argparse
 import numpy as np
-import pandas as pd
+import polars as pl
 from sys import argv
 import yaml
 import torch
 import pickle as pkl 
 
-from model_utils import load_previous_training_state, create_model
-from aux import ABTextDataset, expand_samples_eval, get_balanced_indices, to_device
+from dire.model_utils import load_previous_training_state, create_model
+from dire.aux import ABTextDataset, expand_samples_eval, get_balanced_indices, to_device
 
 N_CONTINUOUS_FEATURES = 3 
 
@@ -18,7 +18,7 @@ def parse_args(argv):
     parser.add_argument('--config', '-c', required=True, help='Configuration file to use for building model.')
     parser.add_argument('--folder', '-f', required=True, help='Folder where config file is located. Output files will be generated here.')
 
-    arguments = parser.parse_args()
+    arguments = parser.parse_args(argv)
 
     return arguments
 
@@ -47,32 +47,18 @@ def predict_ast_results(df, config, amr_prediction_model, epoch_idx, device, voc
     y = [y[j] for j in idx]
 
     dataset = ABTextDataset(x, y, vocab, antibiotics, max_n_tokens, encode_response)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size, shuffle=False, num_workers=num_workers, 
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size, shuffle=False, num_workers=num_workers,
                                              pin_memory=pin_memory, persistent_workers=persistent_workers)
-    
+
     amr_prediction_model.eval()
 
-    preds_list = []
-    trues_list = []
-
-    pS_list = []
-    pI_list = []
-    pR_list = []
-
-    all_species = []
-    all_antibiotics = []
-    all_sample_types = []
-    all_genders = []
-    all_ages = []
-    all_labs = []
-    all_n_ast = []
+    rows = []
 
     with torch.no_grad():
         for batch in dataloader:
             token_ids, year, month, age, species_batch, sample_type_batch, gender_batch, lab_batch, x_pos, y_resp, y_pos = to_device(batch, device)
 
             attention_mask = (token_ids != pad_id).long()
-
             logits_list = amr_prediction_model(token_ids, year, month, age, attention_mask)
 
             for ab_idx, logits_ab in enumerate(logits_list):
@@ -82,7 +68,6 @@ def predict_ast_results(df, config, amr_prediction_model, epoch_idx, device, voc
 
                 logits = logits_ab[mask]
                 targets = y_resp[mask, ab_idx]
-
                 softmax = torch.softmax(logits, dim=1)
 
                 sample_indices = mask.nonzero(as_tuple=False).squeeze(1)
@@ -98,116 +83,96 @@ def predict_ast_results(df, config, amr_prediction_model, epoch_idx, device, voc
                 if n_outputs == 2:
                     pS = softmax[:, 0]
                     pR = softmax[:, 1]
-                    pI = torch.zeros_like(pS) 
+                    pI = torch.zeros_like(pS)
 
-                    if thresholds == None:
+                    if thresholds is None:
                         preds = torch.argmax(softmax, dim=1).cpu().numpy()
                     else:
                         softmax_np = softmax[:, 1].cpu().numpy()
-                        threshold_vals = np.array([thresholds.get((antibiotics[ab_idx], sp, n_ast), 0.5) 
-                                                for sp, n_ast in zip(batch_species_flat, batch_n_ast_flat)])
+                        threshold_vals = np.array([
+                            thresholds.get((antibiotics[ab_idx], sp, n_ast), 0.5)
+                            for sp, n_ast in zip(batch_species_flat, batch_n_ast_flat)
+                        ])
                         preds = np.where(softmax_np >= threshold_vals, 1, 0)
-
-
                 else:
                     pS = softmax[:, 0]
                     pI = softmax[:, 1]
                     pR = softmax[:, 2]
 
-                    if thresholds == None:
+                    if thresholds is None:
                         preds = torch.argmax(softmax, dim=1).cpu().numpy()
                     else:
                         softmax_np = softmax[:, 2].cpu().numpy()
                         preds_max = torch.argmax(softmax, dim=1).cpu().numpy()
-                        threshold_vals = np.array([thresholds.get((antibiotics[ab_idx], sp, n_ast), 0.5) 
-                                                for sp, n_ast in zip(batch_species_flat, batch_n_ast_flat)])
+                        threshold_vals = np.array([
+                            thresholds.get((antibiotics[ab_idx], sp, n_ast), 0.5)
+                            for sp, n_ast in zip(batch_species_flat, batch_n_ast_flat)
+                        ])
                         preds = np.where(softmax_np >= threshold_vals, 2, 0)
                         preds = np.where((preds == 0) & (preds_max == 1), 1, preds)
 
-                all_species.extend(batch_species_flat)
-                all_sample_types.extend(batch_sample_type_flat)
-                all_genders.extend(batch_gender_flat)
-                all_ages.extend(batch_age_flat)
-                all_labs.extend(batch_lab_flat)
-                all_n_ast.extend(batch_n_ast_flat)
-                all_antibiotics.extend([antibiotics[ab_idx]] * len(batch_species_flat))
+                for i in range(len(batch_species_flat)):
+                    rows.append({
+                        'lab': batch_lab_flat[i],
+                        'age': batch_age_flat[i],
+                        'gender': batch_gender_flat[i],
+                        'species': batch_species_flat[i],
+                        'antibiotic': antibiotics[ab_idx],
+                        'sample_type': batch_sample_type_flat[i],
+                        'n_ast_results': batch_n_ast_flat[i],
+                        'true': int(targets[i].item()),
+                        'pred': int(preds[i]),
+                        'pS': float(pS[i].item()),
+                        'pI': float(pI[i].item()),
+                        'pR': float(pR[i].item()),
+                    })
 
-                preds_list.append(preds)
-                trues_list.append(targets.cpu().numpy())
-                pS_list.append(pS.cpu().numpy())
-                pI_list.append(pI.cpu().numpy())
-                pR_list.append(pR.cpu().numpy())
+    if not rows:
+        return pl.DataFrame({
+            'lab': [], 'age': [], 'gender': [], 'species': [], 'antibiotic': [],
+            'sample_type': [], 'n_ast_results': [], 'true': [], 'pred': [],
+            'pS': [], 'pI': [], 'pR': []
+        })
 
-    if preds_list:
-        preds = np.concatenate(preds_list)
-        trues = np.concatenate(trues_list)
-        pS = np.concatenate(pS_list)
-        pI = np.concatenate(pI_list)
-        pR = np.concatenate(pR_list)
-    else:
-        preds = np.array([], dtype=int)
-        trues = np.array([], dtype=int)
-        pS = np.array([])
-        pI = np.array([])
-        pR = np.array([])
-
-    # Collect predictions
-    results_df = pd.DataFrame({
-        "lab": all_labs,
-        "age": all_ages,
-        "gender": all_genders,
-        "species": all_species,
-        "antibiotic": all_antibiotics,
-        "sample_type": all_sample_types,
-        "n_ast_results": all_n_ast,
-        "true": trues,
-        "pred": preds,
-        "pS": pS,
-        "pI": pI,
-        "pR": pR
-    })
-
-    # Convert from numeric to phenotype
+    results_df = pl.DataFrame(rows)
     n_outputs_per_antibiotic = config['model']['n_outputs_per_antibiotic']
     for abx, n_cls in n_outputs_per_antibiotic.items():
-        mask = results_df['antibiotic'] == abx 
-
-        if n_cls == 2:
-            map_dict = {0:'S',1:'R'}
-        else:
-            map_dict = {0:'S',1:'I',2:'R'}
-
-        results_df.loc[mask,'true'] = results_df.loc[mask,'true'].map(map_dict)
-        results_df.loc[mask,'pred'] = results_df.loc[mask,'pred'].map(map_dict)
-
+        mapping = {0: 'S', 1: 'R'} if n_cls == 2 else {0: 'S', 1: 'I', 2: 'R'}
+        results_df = results_df.with_columns(
+            pl.when(pl.col('antibiotic') == abx)
+            .then(pl.col('true').map_elements(lambda v: mapping.get(int(v), v), return_dtype=pl.String))
+            .otherwise(pl.col('true')).alias('true'),
+            pl.when(pl.col('antibiotic') == abx)
+            .then(pl.col('pred').map_elements(lambda v: mapping.get(int(v), v), return_dtype=pl.String))
+            .otherwise(pl.col('pred')).alias('pred')
+        )
     return results_df
 
 
-def conformal_prediction(cal_results, eval_results, config):  
-    min_group_size = 100 
-    cal_results = cal_results.copy()
-    results_out = eval_results.copy()
+def conformal_prediction(cal_results, eval_results, config):
+    min_group_size = 100
+    cal_results = cal_results.clone()
+    results_out = eval_results.clone()
     n_outputs_per_antibiotic = config['model']['n_outputs_per_antibiotic']
-    
-    cal_results['nonconf_S'] = 1.0 - cal_results['pS']
-    cal_results['nonconf_I'] = 1.0 - cal_results['pI']
-    cal_results['nonconf_R'] = 1.0 - cal_results['pR']
-    
+
+    cal_results = cal_results.with_columns(
+        (1.0 - pl.col('pS')).alias('nonconf_S'),
+        (1.0 - pl.col('pI')).alias('nonconf_I'),
+        (1.0 - pl.col('pR')).alias('nonconf_R'),
+    )
+
     alpha = 1 - 0.95
     q_hats = {}
 
-    grouped = cal_results.groupby(['antibiotic', 'species'])
-    for (abx, sp), g in grouped:
+    for (abx, sp), g in cal_results.group_by(['antibiotic', 'species']):
         if n_outputs_per_antibiotic[abx] == 2:
             labels = ['S', 'R']
         else:
             labels = ['S', 'I', 'R']
 
         for lbl in labels:
-            col = f"nonconf_{lbl}"
-            vals = np.sort(g.loc[g['true'] == lbl, col].values)
+            vals = g.filter(pl.col('true') == lbl).get_column(f'nonconf_{lbl}').sort().to_list()
             n = len(vals)
-
             if n >= min_group_size:
                 k = int(np.ceil((n + 1) * (1 - alpha)))
                 k = min(max(k, 1), n)
@@ -218,10 +183,10 @@ def conformal_prediction(cal_results, eval_results, config):
     conformal_sets = []
     q_used = []
 
-    for _, row in results_out.iterrows():
+    for row in results_out.iter_rows(named=True):
         abx = row['antibiotic']
         sp = row['species']
-        p = {"S": row["pS"], "I": row["pI"], "R": row["pR"]}
+        p = {'S': row['pS'], 'I': row['pI'], 'R': row['pR']}
 
         if n_outputs_per_antibiotic[abx] == 2:
             labels = ['S', 'R']
@@ -229,33 +194,15 @@ def conformal_prediction(cal_results, eval_results, config):
             labels = ['S', 'I', 'R']
 
         nonconf = {k: 1.0 - v for k, v in p.items()}
-        include = {}
-        qvals = []
-
-        for lbl in labels:
-            q = q_hats.get((abx, sp, lbl))
-
-            if q is None:
-                include[lbl] = False
-            else:
-                include[lbl] = nonconf[lbl] <= q
-
-            qvals.append(q)
-
         valid_labels = [lbl for lbl in labels if q_hats.get((abx, sp, lbl)) is not None]
         pred_set = [lbl for lbl in valid_labels if nonconf[lbl] <= q_hats[(abx, sp, lbl)]]
+        conformal_sets.append('/'.join(pred_set) if pred_set else '')
+        q_used.append(tuple(q_hats.get((abx, sp, lbl)) for lbl in labels))
 
-        if len(pred_set) == 0:
-            out = ''
-        else:
-            out = '/'.join(pred_set)
-
-        conformal_sets.append(out)
-        q_used.append(tuple(qvals))
-
-    results_out['conformal_set'] = conformal_sets
-    results_out['q_hat'] = q_used
- 
+    results_out = results_out.with_columns(
+        pl.Series('conformal_set', conformal_sets),
+        pl.Series('q_hat', q_used),
+    )
     return results_out
 
 
@@ -269,10 +216,10 @@ def main():
     config['vocab']['vocab_size'] = vocab_size
     pad_id = vocab.token_to_idx['<pad>']
 
-    df = pd.read_csv(config['data']['dataset'], sep='\t')
-    df['sentence'] = [x.split(' ') for x in df['sentence']]
-    df_cal = df.loc[df['fold'].isin(['calibration'])]
-    df_eval = df.loc[df['fold'].isin(['test'])]
+    df = pl.read_csv(config['data']['dataset'], separator='\t')
+    df = df.with_columns(pl.col('sentence').str.split(' '))
+    df_cal = df.filter(pl.col('fold').is_in(['calibration']))
+    df_eval = df.filter(pl.col('fold').is_in(['test']))
 
     rank = 0
     print('Initializing model...')
@@ -299,7 +246,7 @@ def main():
 
     print('Performing conformal prediction...')
     df_eval_cp = conformal_prediction(cal_results_df, eval_results_df, config)
-    df_eval_cp.to_csv(os.path.join(arguments.folder, 'eval_results.tsv'), sep='\t', index=False)
+    df_eval_cp.write_csv(os.path.join(arguments.folder, 'eval_results.tsv'), separator='\t', include_header=True)
 
     print('Evaluation complete!')
 

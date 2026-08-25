@@ -6,16 +6,16 @@ import argparse
 import yaml
 import pickle as pkl
 import numpy as np
-import pandas as pd
+import polars as pl
 import random
 import gc
 from sys import argv
  
 from transformers import get_cosine_schedule_with_warmup
 from sklearn.metrics import roc_curve
-from aux import ABTextDataset, expand_samples_train, expand_samples_eval, get_balanced_indices, to_device, append_df_to_tsv, update_ema, print_progress
-from model_utils import create_model, load_previous_training_state, start_optimizer_loss, save_model
-from evaluate_model import predict_ast_results
+from dire.aux import ABTextDataset, expand_samples_train, expand_samples_eval, get_balanced_indices, to_device, append_df_to_tsv, update_ema, print_progress
+from dire.model_utils import create_model, load_previous_training_state, start_optimizer_loss, save_model
+from dire.evaluate_model import predict_ast_results
 
 N_CONTINUOUS_FEATURES = 3 
 
@@ -23,7 +23,7 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(description='Train transformer model for AST prediction.')
     parser.add_argument('--config', '-c', required=True, help='Config file name.')
     parser.add_argument('--folder', '-f', required=True, help='Config/output folder.')
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def _apply_regularization(probs, class_ids, lambda_reg, device):
@@ -251,7 +251,7 @@ def forward_epoch(df, config, amr_prediction_model, criterion, optimizer, schedu
 
 
 def main():
-    arguments = parse_args(argv)
+    arguments = parse_args(argv[1:])
     os.makedirs(arguments.folder, exist_ok=True)
     
     with open(os.path.join(arguments.folder, arguments.config), 'r') as f:
@@ -263,11 +263,11 @@ def main():
     pad_id = vocab.token_to_idx['<pad>']
     n_epochs = config['train']['n_epochs']
 
-    df = pd.read_csv(config['data']['dataset'], sep='\t')
-    df['sentence'] = [x.split(' ') for x in df['sentence']]
-    df_train = df.loc[df['fold'].isin(['train'])]
-    df_val = df.loc[df['fold'].isin(['validation'])]
-    df_cal = df.loc[df['fold'].isin(['calibration'])]
+    df = pl.read_csv(config['data']['dataset'], separator='\t')
+    df = df.with_columns(pl.col('sentence').str.split(' '))
+    df_train = df.filter(pl.col('fold').is_in(['train']))
+    df_val = df.filter(pl.col('fold').is_in(['validation']))
+    df_cal = df.filter(pl.col('fold').is_in(['calibration']))
 
     rank = 0
     print('Initializing model...')
@@ -329,7 +329,7 @@ def main():
                            processed_batches_global, (n_epochs * train_batches_per_epoch),
                            ema_batch_time, epoch_start)
  
-        avg_train_results = pd.DataFrame({
+        avg_train_results = pl.DataFrame({
             'avg_loss': [train_loss],
             'avg_acc': [train_acc],
             'epoch': [epoch]
@@ -350,7 +350,7 @@ def main():
                         processed_batches_global, total_training_batches,
                         ema_batch_time, epoch_start)
 
-        avg_val_results = pd.DataFrame({
+        avg_val_results = pl.DataFrame({
             'avg_loss': [val_loss],
             'avg_acc': [val_acc],
             'epoch': [epoch]

@@ -1,0 +1,65 @@
+import argparse
+import sys
+
+from scripts import evaluate_model as evaluate_module
+from scripts import process_data as process_data_module
+from scripts import process_eval_data as process_eval_data_module
+from scripts import specific_predictions as specific_predictions_module
+from scripts import train_model as train_module
+
+
+def _invoke(module, argv):
+    module.argv = list(argv)
+    return module.main()
+
+
+def train(argv=None):
+    args = sys.argv[2:] if argv is None else list(argv)
+    return _invoke(train_module, args)
+
+
+def evaluate(argv=None):
+    args = sys.argv[2:] if argv is None else list(argv)
+    return _invoke(evaluate_module, args)
+
+
+def process_data(argv=None):
+    args = sys.argv[2:] if argv is None else list(argv)
+    return _invoke(process_data_module, args)
+
+
+def process_eval_data(argv=None):
+    args = sys.argv[2:] if argv is None else list(argv)
+    return _invoke(process_eval_data_module, args)
+
+
+def specific_predictions(argv=None):
+    args = sys.argv[2:] if argv is None else list(argv)
+    return _invoke(specific_predictions_module, args)
+
+
+def main(argv=None):
+    args = sys.argv[1:] if argv is None else list(argv)
+    if not args:
+        parser = argparse.ArgumentParser(prog="dire")
+        parser.print_help()
+        return 0
+
+    command = args[0]
+    command_args = args[1:]
+
+    if command == "train":
+        return train(command_args)
+    if command == "evaluate":
+        return evaluate(command_args)
+    if command == "process-data":
+        return process_data(command_args)
+    if command == "process-eval-data":
+        return process_eval_data(command_args)
+    if command == "specific-predictions":
+        return specific_predictions(command_args)
+
+    parser = argparse.ArgumentParser(prog="dire")
+    parser.add_argument("command", choices=["train", "evaluate", "process-data", "process-eval-data", "specific-predictions"])
+    parser.print_help()
+    return 1

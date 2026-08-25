@@ -3,8 +3,8 @@ import torch.nn as nn
 import torch.optim as optim
 import os 
 import pickle as pkl 
-import pandas as pd 
-from model import AMRPredictionModel 
+import polars as pl
+from dire.model import AMRPredictionModel 
 
 def create_model(config, pad_id, rank=0):
     model_cfg = config['model']
@@ -31,6 +31,12 @@ def create_model(config, pad_id, rank=0):
         print(f'Model parameters: {sum(p.numel() for p in amr_prediction_model.parameters() if p.requires_grad):,}')
 
     return amr_prediction_model
+
+
+def load_previous_model(model_folder, amr_prediction_model, rank=0, load_previous=True):
+    if not load_previous:
+        return {}
+    return load_previous_training_state(model_folder, amr_prediction_model, n_epochs=10_000, rank=rank)
 
 
 def load_previous_training_state(model_folder, amr_prediction_model, n_epochs, rank=0):
@@ -69,10 +75,10 @@ def load_previous_training_state(model_folder, amr_prediction_model, n_epochs, r
     tsv_state = {}
     if os.path.exists(train_log) and os.path.exists(val_log):
         try:
-            df_train_log = pd.read_csv(train_log, sep='\t')
-            df_val_log = pd.read_csv(val_log, sep='\t')
+            df_train_log = pl.read_csv(train_log, separator='\t')
+            df_val_log = pl.read_csv(val_log, separator='\t')
 
-            if not df_train_log.empty and not df_val_log.empty:
+            if not df_train_log.is_empty() and not df_val_log.is_empty():
                 last_epoch = int(min(df_train_log['epoch'].max(), df_val_log['epoch'].max()))
                 start_epoch = last_epoch + 1
 

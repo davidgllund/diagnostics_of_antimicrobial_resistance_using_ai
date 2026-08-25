@@ -1,6 +1,5 @@
 #!/usr/bin/env python
-import pandas as pd
-import numpy as np
+import polars as pl
 from pathlib import Path
 import pyreadr
 
@@ -22,171 +21,125 @@ def read_rdata(data_dir, filenames):
     dfs = []
     for fname in filenames:
         result = pyreadr.read_r(str(data_dir / fname))
-        dfs.append(result['test_data'])
+        dfs.append(pl.from_pandas(result['test_data']))
+    return pl.concat(dfs, how='vertical_relaxed')
 
-    return pd.concat(dfs, ignore_index=True)
 
 def load_lookup_table(path):
-    return (
-        pd.read_csv(path, header=None, sep="\t")
-        .set_index(0)[1]
-        .to_dict()
-    )
+    df = pl.read_csv(path, separator='\t', has_header=False)
+    return dict(zip(df.get_column(0).to_list(), df.get_column(1).to_list()))
+
 
 def prefilter_dataset(df, taxonomy):
-    df = df.copy()
+    df = df.filter(
+        (pl.col('smittamne_namn') != 'NEGATIV') &
+        pl.col('sir').is_not_null() &
+        (~pl.col('patient_fodelse').is_in(['Okänd', 'Okï¿½n'])) &
+        (pl.col('antibiotikum_namn') != 'Betalaktamas') &
+        (pl.col('antibiotikum_namn') != 'ResNet')
+    )
 
-    df = df[
-        (df['smittamne_namn'] != 'NEGATIV') &
-        (df['sir'].notna()) &
-        (~df['patient_fodelse'].isin(['Okänd', 'Okï¿½n'])) &
-        (df['antibiotikum_namn'] != 'Betalaktamas') &
-        (df['antibiotikum_namn'] != 'ResNet')
-    ]
-
-    df = df.fillna('<unk>')
-    genus = df['smittamne_namn'].str.split(" ", n=1).str[0]
-    df = df[genus.isin(taxonomy)]
-
-    species = df['smittamne_namn'].str.split(" ", n=1).str[1]
-    df = df[species != "art"]
-
+    df = df.fill_null('<unk>')
+    genus = pl.col('smittamne_namn').str.split(' ', 1).list.get(0)
+    species = pl.col('smittamne_namn').str.split(' ', 1).list.get(1)
+    df = df.filter(genus.is_in(taxonomy))
+    df = df.filter(species != 'art')
     return df
 
+
 def format_dataset(df, antibiotic_map, species_map, sample_map):
-    df = df.copy()
-
-    df['provtagnings_datum'] = pd.to_datetime(
-        df['provtagnings_datum'],
-        errors='coerce'
+    df = df.with_columns(
+        pl.col('provtagnings_datum').str.strptime(pl.Datetime, strict=False).alias('provtagnings_datum'),
+        (pl.col('provtagnings_datum').dt.year() - pl.col('patient_fodelse').cast(pl.String).str.slice(0, 4).cast(pl.Int64, strict=False)).alias('patient_alder'),
+        pl.col('patient_kon').map_elements(
+            lambda x: {1: 'M', 2: 'F', 3: '<unk>'}.get(x, '<unk>'),
+            return_dtype=pl.String,
+        ).alias('patient_kon')
     )
 
-    year_sample = df['provtagnings_datum'].dt.year
-    year_birth = pd.to_numeric(
-        df['patient_fodelse'].astype(str).str[:4],
-        errors='coerce'
+    df = df.with_columns(
+        pl.when(pl.col('smittamne_namn') == 'EHEC (Enterohemorragisk E. coli)')
+        .then(pl.lit('Escherichia coli'))
+        .otherwise(pl.col('smittamne_namn'))
+        .alias('smittamne_namn'),
+        pl.col('provtagnings_datum').dt.strftime('%Y-%m-%d').alias('provtagnings_datum'),
+        pl.col('antibiotikum_namn').str.replace(r'\s*\(.*\)', '', literal=False).alias('antibiotikum_namn')
     )
 
-    df['patient_alder'] = year_sample - year_birth
-    
-    df['patient_kon'] = df['patient_kon'].map({
-        1: 'M',
-        2: 'F',
-        3: '<unk>'
-    }).fillna('<unk>')
+    df = df.with_columns(
+        pl.col('antibiotikum_namn').map_elements(lambda x: antibiotic_map.get(x, x), return_dtype=pl.String).alias('antibiotic'),
+        pl.col('smittamne_namn').map_elements(lambda x: species_map.get(x, x), return_dtype=pl.String).alias('pathogen'),
+        pl.col('provmaterial_namn').map_elements(lambda x: sample_map.get(x, x), return_dtype=pl.String).alias('specimen'),
+    )
 
-    df['smittamne_namn'] = df['smittamne_namn'].replace({
-        'EHEC (Enterohemorragisk E. coli)': 'Escherichia coli'
-    })
-
-    df['provtagnings_datum'] = df['provtagnings_datum'].dt.strftime("%Y-%m-%d")
-    df['antibiotikum_namn'] = df['antibiotikum_namn'].str.replace(r"\s*\(.*\)", "", regex=True)
-    df['antibiotic'] = df['antibiotikum_namn'].map(antibiotic_map)
-    df['pathogen'] = df['smittamne_namn'].map(species_map)
-    df['specimen'] = df['provmaterial_namn'].map(sample_map)
-
-    df = df.loc[df['specimen'] != 'IGNORE'] 
-
-    df = df.rename(columns={
+    df = df.filter(pl.col('specimen') != 'IGNORE')
+    df = df.rename({
         'provtagnings_datum': 'date',
         'labb_kod': 'lab_id',
         'patient_kon': 'gender',
         'patient_alder': 'age',
         'id': 'isolate_id'
-    })[
-        ['date', 'lab_id', 'specimen', 'gender', 'age', 
-         'isolate_id', 'pathogen', 'antibiotic', 'sir']
-    ]
+    })
+    return df.select([
+        'date', 'lab_id', 'specimen', 'gender', 'age', 'isolate_id', 'pathogen', 'antibiotic', 'sir'
+    ])
 
-    return df
 
 def filter_ab_sp_combinations(df):
-    df = df.copy()
-    
-    # Extract species  with sufficient data
+    df = df.clone()
+
     top_sp = (
-        df[['lab_id', 'isolate_id', 'pathogen']]
-        .drop_duplicates()
-        .groupby('pathogen')
-        .size()
-        .reset_index(name='Freq')
+        df.select(['lab_id', 'isolate_id', 'pathogen']).unique().group_by('pathogen').len().filter(pl.col('len') >= 10000)
     )
+    df = df.join(top_sp.select('pathogen'), on='pathogen', how='inner')
 
-    top_sp = top_sp[top_sp['Freq'] >= 10000]
-    df = df.loc[df['pathogen'].isin(top_sp['pathogen'])]
-
-    # Extract antibiotic-species combinations with sufficient data
     ab_keep_df = (
-        df
-        .assign(isS = df['sir'] == 'S')
-        .assign(isI = df['sir'] == 'I')
-        .assign(isR = df['sir'] == 'R')
-        .groupby(['pathogen', 'antibiotic'])
-        .agg(I_rate=('isI', 'mean'),
-            S_rate=('isS', 'mean'), 
-            R_rate=('isR', 'mean'), 
-            n=('sir', 'size'))
-        .reset_index()
+        df.with_columns(
+            (pl.col('sir') == 'S').cast(pl.Int8).alias('isS'),
+            (pl.col('sir') == 'I').cast(pl.Int8).alias('isI'),
+            (pl.col('sir') == 'R').cast(pl.Int8).alias('isR'),
+        )
+        .group_by(['pathogen', 'antibiotic'])
+        .agg(
+            pl.col('isI').mean().alias('I_rate'),
+            pl.col('isS').mean().alias('S_rate'),
+            pl.col('isR').mean().alias('R_rate'),
+            pl.len().alias('n')
+        )
+        .filter((pl.col('S_rate') >= 0.05) & (pl.col('R_rate') >= 0.05) & (pl.col('n') >= 1000))
     )
 
-    ab_keep_df = ab_keep_df[
-        (ab_keep_df['S_rate'] >= 0.05) &
-        (ab_keep_df['R_rate'] >= 0.05) &
-        (ab_keep_df['n'] >= 1000)
-    ]
+    df = df.join(ab_keep_df.select(['pathogen', 'antibiotic']), on=['pathogen', 'antibiotic'], how='inner')
 
-    df = df.merge(
-        ab_keep_df[['pathogen', 'antibiotic']],
-        on=['pathogen', 'antibiotic'],
-        how='inner'
-    )
+    valid_i_pairs = {(row[0], row[1]) for row in ab_keep_df.filter(pl.col('I_rate') >= 0.05).select(['pathogen', 'antibiotic']).iter_rows()}
+    rows = []
+    for row in df.iter_rows(named=True):
+        if row['sir'] == 'I' and (row['pathogen'], row['antibiotic']) not in valid_i_pairs:
+            continue
+        rows.append(row)
+    df = pl.DataFrame(rows)
 
-    # In relevant cases, keep tests where the result is "I"
-    tmp = ab_keep_df[ab_keep_df['I_rate'] >= 0.05]
-    valid_i_pairs = set(zip(tmp['pathogen'], tmp['antibiotic']))
-    df = df[
-        ~((df['sir'] == 'I') & 
-        (~df[['pathogen', 'antibiotic']].apply(tuple, axis=1).isin(valid_i_pairs)))
-    ]
-
-    # Keep only species where at least 5 antibitoics have passed the criteria above
     final_sp = (
-        df[['pathogen', 'antibiotic']]
-        .drop_duplicates()
-        .groupby('pathogen')
-        .size()
-        .reset_index(name='Freq')
+        df.select(['pathogen', 'antibiotic']).unique().group_by('pathogen').len().filter(pl.col('len') >= 5)
     )
-
-    final_sp = final_sp[final_sp['Freq'] >= 5]
-    df = df.loc[df['pathogen'].isin(final_sp['pathogen'])]
-
+    df = df.join(final_sp.select('pathogen'), on='pathogen', how='inner')
     return df
 
+
 def main():
-    # Load data
     svebar = read_rdata(DATA_DIR, RDATA_FILES)
-    
-   # Load auxiliary files
-    taxonomy = set(
-        pd.read_csv(TAXONOMY_FILE, sep="\t", usecols=['genus'])['genus']
-    )
+
+    taxonomy = set(pl.read_csv(TAXONOMY_FILE, separator='\t', use_columns=['genus']).get_column('genus').to_list())
 
     antibiotic_map = load_lookup_table(INDEX_DIR / 'ab_abbrev.tsv')
     species_map = load_lookup_table(INDEX_DIR / 'species_abbrev.tsv')
     sample_map = load_lookup_table(INDEX_DIR / 'sample_categ.tsv')
-    
-    # Prefiltering
+
     svebar = prefilter_dataset(svebar, taxonomy)
-
-    # Format relevant columns
     svebar = format_dataset(svebar, antibiotic_map, species_map, sample_map)
-
-    # Keep only antibiotic-species combinations with sufficent data
     svebar = filter_ab_sp_combinations(svebar)
 
-    # Write output
-    svebar.to_csv(OUTPUT_FILE, sep='\t', index=False)
+    svebar.write_csv(OUTPUT_FILE, separator='\t')
 
 if __name__ == '__main__':
     main()

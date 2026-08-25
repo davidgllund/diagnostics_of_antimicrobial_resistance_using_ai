@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dire"
+version = "0.1.0"
+description = "AMR prediction with transformer models"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = [
+  "torch>=2.1.2",
+  "transformers>=4.39.3",
+  "polars>=1.0.0",
+  "numpy>=2.3.3",
+  "scikit-learn>=1.3.1",
+  "pyyaml>=6.0",
+  "tqdm>=4.66",
+]
+
+[project.scripts]
+dire = "dire.cli:main"
+dire-train = "dire.cli:train"
+dire-evaluate = "dire.cli:evaluate"
+dire-process-data = "dire.cli:process_data"
+dire-process-eval-data = "dire.cli:process_eval_data"
+dire-specific-predictions = "dire.cli:specific_predictions"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
