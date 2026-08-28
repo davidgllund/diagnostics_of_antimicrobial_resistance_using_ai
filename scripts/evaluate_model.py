@@ -1,13 +1,13 @@
 #!/usr/bin/env python
-import os
 import argparse
 import numpy as np
-import polars as pl
-from sys import argv
-import yaml
-import torch
+import os
 import pickle as pkl 
+import polars as pl
+import torch
+import yaml
 
+from sys import argv
 from dire.model_utils import load_previous_training_state, create_model
 from dire.aux import ABTextDataset, expand_samples_eval, get_balanced_indices, to_device
 
@@ -199,15 +199,16 @@ def conformal_prediction(cal_results, eval_results, config):
         conformal_sets.append('/'.join(pred_set) if pred_set else '')
         q_used.append(tuple(q_hats.get((abx, sp, lbl)) for lbl in labels))
 
+    q_hat_str = [",".join("" if v is None else str(v) for v in tup) for tup in q_used]
     results_out = results_out.with_columns(
         pl.Series('conformal_set', conformal_sets),
-        pl.Series('q_hat', q_used),
+        pl.Series('q_hat', q_hat_str),
     )
-    return results_out
+    return results_out, q_hats
 
 
 def main():
-    arguments = parse_args(argv)
+    arguments = parse_args(argv[1:])
     with open(os.path.join(arguments.folder, arguments.config), 'r') as f:
         config = yaml.safe_load(f)
 
@@ -245,8 +246,17 @@ def main():
     eval_results_df = predict_ast_results(df_eval, config, amr_prediction_model, 100, device, vocab, pad_id, thresholds)
 
     print('Performing conformal prediction...')
-    df_eval_cp = conformal_prediction(cal_results_df, eval_results_df, config)
+    df_eval_cp, q_hats = conformal_prediction(cal_results_df, eval_results_df, config)
     df_eval_cp.write_csv(os.path.join(arguments.folder, 'eval_results.tsv'), separator='\t', include_header=True)
+
+    # Save q_hats (conformal thresholds) so other scripts can load them
+    qh_path = os.path.join(arguments.folder, config['model'].get('q_hats', 'q_hats.pkl'))
+    try:
+        with open(qh_path, 'wb') as f:
+            pkl.dump(q_hats, f)
+        print(f'Saved q_hats to {qh_path}')
+    except Exception as e:
+        print(f'Warning: Failed to save q_hats to {qh_path}: {e}')
 
     print('Evaluation complete!')
 
