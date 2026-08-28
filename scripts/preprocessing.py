@@ -1,7 +1,8 @@
 #!/usr/bin/env python
 import polars as pl
-from pathlib import Path
 import pyreadr
+
+from pathlib import Path
 
 DATA_DIR = Path('/home/dlund/dire/data/svebar')
 INDEX_DIR = Path('/home/dlund/dire/index_files')

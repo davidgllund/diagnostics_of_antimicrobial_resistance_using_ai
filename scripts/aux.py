@@ -1,10 +1,9 @@
 #!/usr/bin/env python
-import torch
-import polars as pl
 import numpy as np
-import random
 import os
-import time
+import polars as pl
+import random
+import torch
 
 from collections import defaultdict, Counter
 from torch.utils.data import Dataset
@@ -72,7 +71,8 @@ class ABTextDataset(Dataset):
         lab = self.lab[idx]
 
         return token_x, year, month, age, species, sample_type, gender, lab, x_pos, y_resp, y_pos
-    
+
+
 class Vocab:
     def __init__(self, tokens=[], min_freq=0, reserved_tokens=[]):
         if tokens and isinstance(tokens[0], list):
@@ -101,6 +101,7 @@ class Vocab:
         
         return self.idx_to_token[indices]
 
+
 def separate_duplicate_class(items, classes):
     counts = Counter(classes)
 
@@ -118,6 +119,7 @@ def separate_duplicate_class(items, classes):
     remaining = [item for i, item in enumerate(items) if i not in selected_indices]
     
     return extracted, remaining
+
 
 def expand_samples_train(dataset, isolates_per_batch, n_metadata, seed, max_predictor_antibiotics=6, samples_per_k=1):
     if seed is None:
@@ -158,6 +160,7 @@ def expand_samples_train(dataset, isolates_per_batch, n_metadata, seed, max_pred
                 all_responses.append(response)
 
     return all_predictors, all_responses
+
 
 def expand_samples_eval(dataset, config, isolates_per_batch, n_metadata, seed, max_predictor_antibiotics=6):
     if seed is None:

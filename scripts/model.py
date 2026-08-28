@@ -2,8 +2,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from transformers import AutoModel, AutoConfig
-from typing import Optional
 
 class TransformerEncoder(nn.Module):
     def __init__(self, embedding_size, n_heads, encoder_stack_depth, ffn_dimension, max_n_tokens, vocab_size, 

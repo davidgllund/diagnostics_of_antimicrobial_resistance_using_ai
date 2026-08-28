@@ -1,12 +1,12 @@
 #!/usr/bin/env python
 import argparse
-import torch
-import polars as pl
 import numpy as np
+import polars as pl
+import torch
+
 from collections import defaultdict
 from tqdm import tqdm
 from sys import argv
-
 from dire.aux import Vocab
 
 def parse_args(argv):

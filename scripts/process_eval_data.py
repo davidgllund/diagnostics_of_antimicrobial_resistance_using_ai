@@ -1,13 +1,13 @@
 #!/usr/bin/env python
 import argparse
-import torch
+import numpy as np
 import polars as pl
 import random
-import numpy as np
-from collections import Counter
-from tqdm import tqdm
-from sys import argv
+import torch
 
+from collections import Counter
+from sys import argv
+from tqdm import tqdm
 from dire.aux import Vocab
 
 def parse_args(argv):
@@ -29,6 +29,7 @@ def parse_args(argv):
     
     return arguments
 
+
 def read_dict(filename):
     dictionary = {}
     with open(filename, 'r') as f:
@@ -36,6 +37,7 @@ def read_dict(filename):
             items = line.split('\t')
             dictionary[items[0]] = items[1].strip()      
     return dictionary
+
 
 def preprocess_data(df, ab_abbrev, sp_abbrev, sample_categ): 
     ab_dict = read_dict(ab_abbrev)
@@ -60,6 +62,7 @@ def preprocess_data(df, ab_abbrev, sp_abbrev, sample_categ):
 
     return df
 
+
 def format_ast(lst):
     uniq_items = lst.unique()
 
@@ -80,6 +83,7 @@ def format_ast(lst):
 
         return output
 
+
 def format_data(df):
     rows = []
     for _, group in df.group_by('id', maintain_order=True):
@@ -93,6 +97,7 @@ def format_data(df):
         ])
         rows.append(sentence)
     return rows
+
 
 def generate_balanced_labels(length, labels):
     labels = list(labels)
@@ -109,9 +114,11 @@ def generate_balanced_labels(length, labels):
     random.shuffle(balanced)
     return balanced
 
+
 def count_antibiotics(sentence, n_metadata):
     n_ab = len(sentence.split(' ')) - n_metadata
     return n_ab
+
 
 def main():
     arguments = parse_args(argv)
@@ -133,6 +140,7 @@ def main():
     print('Generating vocabulary')
     vocab = Vocab(tokens=list({x for lst in sentence for x in lst.split(' ')[3:]}), reserved_tokens=['<cls>','<pad>','<mask>','<sep>'])
     torch.save(vocab, arguments.vocab)
+
 
 if __name__ == '__main__':
     main()

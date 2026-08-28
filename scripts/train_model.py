@@ -1,16 +1,16 @@
 #!/usr/bin/env python
-import torch 
-import os
-import time 
 import argparse
-import yaml
-import pickle as pkl
+import gc
 import numpy as np
+import os
+import pickle as pkl
 import polars as pl
 import random
-import gc
+import time 
+import torch 
+import yaml
+
 from sys import argv
- 
 from transformers import get_cosine_schedule_with_warmup
 from sklearn.metrics import roc_curve
 from dire.aux import ABTextDataset, expand_samples_train, expand_samples_eval, get_balanced_indices, to_device, append_df_to_tsv, update_ema, print_progress
@@ -133,23 +133,36 @@ def _compute_loss(logits_list, y_pos, y_resp, criterion, train, config, antibiot
 def compute_classification_thresholds(df, config):
     outputs_per_antibiotic = config['model']['n_outputs_per_antibiotic']
     thresholds = {}
-    for ab, g in df.groupby(['antibiotic', 'species', 'n_ast_results']):
-        n_outputs = outputs_per_antibiotic[ab[0]]
-        y_score = g['pR'].values
+
+    # iterate unique (antibiotic, species, n_ast_results) combinations
+    groups = df.select(['antibiotic', 'species', 'n_ast_results']).unique()
+    for ab, sp, n_ast in groups.iter_rows():
+        sub = df.filter(
+            (pl.col('antibiotic') == ab) &
+            (pl.col('species') == sp) &
+            (pl.col('n_ast_results') == n_ast)
+        )
+
+        if sub.height == 0:
+            continue
+
+        n_outputs = outputs_per_antibiotic[ab]
+        y_score = np.array(sub['pR'].to_list(), dtype=float)
+        truths = sub['true'].to_list()
 
         if n_outputs == 2:
-            y_true = np.array(g['true'].replace({'S':0,'R':1}), dtype=int)
+            y_true = np.array([0 if t == 'S' else 1 for t in truths], dtype=int)
+        else:
+            y_true = np.array([0 if t in ('S', 'I') else 1 for t in truths], dtype=int)
 
-        elif n_outputs == 3:
-            y_true = np.array(g['true'].replace({'S':0,'I':0,'R':1}), dtype=int)
+        if y_true.size == 0:
+            continue
 
         fpr, tpr, thr = roc_curve(y_true, y_score)
-
         dist = np.sqrt((1 - tpr)**2 + fpr**2)
         best_point = thr[np.argmin(dist)]
+        thresholds[(ab, sp, n_ast)] = best_point
 
-        thresholds[ab] = best_point
-        
     return thresholds
 
 
@@ -385,6 +398,7 @@ def main():
 
     with open(config['model']['thresholds'], 'wb') as f:
             pkl.dump(thresholds, f)
+
 
 if __name__ == '__main__':
     main()
