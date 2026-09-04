@@ -28,7 +28,8 @@ def read_rdata(data_dir, filenames):
 
 def load_lookup_table(path):
     df = pl.read_csv(path, separator='\t', has_header=False)
-    return dict(zip(df.get_column(0).to_list(), df.get_column(1).to_list()))
+    mapping = dict(zip(df['column_1'].to_list(), df['column_2'].to_list()))
+    return mapping
 
 
 def prefilter_dataset(df, taxonomy):
@@ -41,8 +42,8 @@ def prefilter_dataset(df, taxonomy):
     )
 
     df = df.fill_null('<unk>')
-    genus = pl.col('smittamne_namn').str.split(' ', 1).list.get(0)
-    species = pl.col('smittamne_namn').str.split(' ', 1).list.get(1)
+    genus = pl.col('smittamne_namn').str.split(' ').list.get(0)
+    species = pl.col('smittamne_namn').str.split(' ').list.get(1)
     df = df.filter(genus.is_in(taxonomy))
     df = df.filter(species != 'art')
     return df
@@ -50,8 +51,11 @@ def prefilter_dataset(df, taxonomy):
 
 def format_dataset(df, antibiotic_map, species_map, sample_map):
     df = df.with_columns(
-        pl.col('provtagnings_datum').str.strptime(pl.Datetime, strict=False).alias('provtagnings_datum'),
-        (pl.col('provtagnings_datum').dt.year() - pl.col('patient_fodelse').cast(pl.String).str.slice(0, 4).cast(pl.Int64, strict=False)).alias('patient_alder'),
+        pl.col('provtagnings_datum')
+        .cast(pl.String, strict=False)
+        .str.strptime(pl.Datetime, strict=False)
+        .alias('provtagnings_datum'),
+        (pl.col('provtagnings_datum').dt.year() - pl.col('patient_fodelse').cast(pl.String).str.slice(0, 4).cast(pl.Int64, strict=False)).alias("patient_alder"),
         pl.col('patient_kon').map_elements(
             lambda x: {1: 'M', 2: 'F', 3: '<unk>'}.get(x, '<unk>'),
             return_dtype=pl.String,
