@@ -46,15 +46,15 @@ def format_ast(lst):
 def format_data(df):
     rows = []
     for _, group in df.group_by(['lab_id', 'isolate_id'], maintain_order=True):
-        first = group.row(0)
+        row_map = dict(zip(group.columns, group.row(0)))
         record = {
-            'year': first[0],
-            'month': first[1],
-            'age': first[2],
-            'lab_id': first[3],
-            'gender': first[4],
-            'pathogen': first[5],
-            'specimen': first[6],
+            'year': row_map['year'],
+            'month': row_map['month'],
+            'age': row_map['age'],
+            'lab_id': row_map['lab_id'],
+            'gender': row_map['gender'],
+            'pathogen': row_map['pathogen'],
+            'specimen': row_map['specimen'],
             'antibiotic': group['antibiotic'].to_list(),
             'sir': group['sir'].to_list(),
         }
