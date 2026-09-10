@@ -13,10 +13,13 @@ class TransformerEncoder(nn.Module):
         self.pad_idx = pad_id
         self.embedding_size = embedding_size
 
+        n_continuous = 3
+
+        # Create custom config for transformer
         config = AutoConfig.from_pretrained(
             model_name,
             vocab_size=vocab_size,
-            max_position_embeddings=max_n_tokens,
+            max_position_embeddings=max_n_tokens + n_continuous,
             hidden_size=embedding_size,
             num_hidden_layers=encoder_stack_depth,
             num_attention_heads=n_heads,
@@ -28,6 +31,7 @@ class TransformerEncoder(nn.Module):
             pad_token_id=pad_id
         )
 
+        # Load transformer model with custom config
         self.transformer = AutoModel.from_config(config)
 
         # No positional encoding
@@ -35,14 +39,34 @@ class TransformerEncoder(nn.Module):
             self.transformer.embeddings.position_embeddings.weight.zero_()
         self.transformer.embeddings.position_embeddings.weight.requires_grad_(False)
         
+        # Token embedding layer (same as transformer's)
         self.token_embedding = nn.Embedding(vocab_size, embedding_size, padding_idx=pad_id)
         self.transformer.embeddings.word_embeddings = self.token_embedding
         
-    def forward(self, token_ids, attention_mask):
+        # Continuous feature projections
+        self.year_proj = nn.Linear(1, embedding_size)
+        self.month_proj = nn.Linear(1, embedding_size)
+        self.age_proj = nn.Linear(1, embedding_size)
+        
+    def forward(self, token_ids, year, month, age, attention_mask):
+        # Embed tokens
         token_embeds = self.token_embedding(token_ids)
 
+        # Project continuous features
+        year_emb = self.year_proj(year)
+        month_emb = self.month_proj(month)
+        age_emb = self.age_proj(age)
+        continuous_embeds = torch.stack([year_emb, month_emb, age_emb], dim=1)
+
+        # Concatenate continuous features and token embeddings
+        input_embeds = torch.cat([continuous_embeds, token_embeds], dim=1)
+
+        # Continuous features are never padding, so always attend to them.
+        continuous_mask = attention_mask.new_ones(attention_mask.size(0), continuous_embeds.size(1))
+        attention_mask = torch.cat([continuous_mask, attention_mask], dim=1)
+
         x = self.transformer(
-            inputs_embeds=token_embeds,
+            inputs_embeds=input_embeds,
             attention_mask=attention_mask
         ).last_hidden_state
 
@@ -55,8 +79,8 @@ class AntibioticClassifier(nn.Module):
 
         self.antibiotic = antibiotic
 
-        n_continuous = 3
-        input_size = embedding_size + n_continuous 
+        n_sampling_time_data = 2
+        input_size = embedding_size + n_sampling_time_data 
 
         self.classification_head = nn.Sequential(
             nn.Linear(input_size, hidden_size),
@@ -98,20 +122,19 @@ class AMRPredictionModel(nn.Module):
         ])
     
     def forward(self, token_ids, year, month, age, attention_mask):
-        encoded = self.encoder(token_ids, attention_mask)
-        cls_representation = encoded[:, 0, :] 
+        encoded = self.encoder(token_ids, year, month, age, attention_mask)
+        cls_representation = encoded[:, 3, :] 
 
-        contiuous_data = torch.cat([
+        sampling_time_data = torch.cat([
             (year - 2015) / 10.0, 
-            month / 12.0,
-            age / 100.0
+            month / 12.0 
         ], dim=1)
 
         logits_list = []
 
         for classifier in self.classifiers:
 
-            cls_input = torch.cat([cls_representation, contiuous_data], dim=1)
+            cls_input = torch.cat([cls_representation, sampling_time_data], dim=1)
             logits = classifier(cls_input)
 
             logits_list.append(logits)
