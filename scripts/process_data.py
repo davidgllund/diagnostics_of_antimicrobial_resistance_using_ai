@@ -45,7 +45,8 @@ def format_ast(lst):
 
 def format_data(df):
     rows = []
-    for _, group in df.group_by(['lab_id', 'isolate_id'], maintain_order=True):
+    n_groups = df.select(['lab_id', 'isolate_id']).unique().height
+    for _, group in tqdm(df.group_by(['lab_id', 'isolate_id'], maintain_order=True), total=n_groups, desc='Formatting isolates'):
         row_map = dict(zip(group.columns, group.row(0)))
         record = {
             'year': row_map['year'],
@@ -71,7 +72,7 @@ def count_antibiotics(sentence, n_metadata):
     return n_ab
 
 def main():
-    arguments = parse_args(argv)
+    arguments = parse_args(argv[1:])
     data = pl.read_csv(arguments.input, separator='\t')
 
     data = data.with_columns(

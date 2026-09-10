@@ -3,6 +3,7 @@ import polars as pl
 import pyreadr
 
 from pathlib import Path
+from tqdm import tqdm
 
 DATA_DIR = Path('/home/dlund/dire/data/svebar')
 INDEX_DIR = Path('/home/dlund/dire/index_files')
@@ -67,6 +68,10 @@ def format_dataset(df, antibiotic_map, species_map, sample_map):
         .then(pl.lit('Escherichia coli'))
         .otherwise(pl.col('smittamne_namn'))
         .alias('smittamne_namn'),
+        pl.when(pl.col('labb_kod').is_in(['SE110', 'SE230']))
+        .then(pl.lit('SE340'))
+        .otherwise(pl.col('labb_kod'))
+        .alias('labb_kod'),
         pl.col('provtagnings_datum').dt.strftime('%Y-%m-%d').alias('provtagnings_datum'),
         pl.col('antibiotikum_namn').str.replace(r'\s*\(.*\)', '', literal=False).alias('antibiotikum_namn')
     )
@@ -118,7 +123,7 @@ def filter_ab_sp_combinations(df):
 
     valid_i_pairs = {(row[0], row[1]) for row in ab_keep_df.filter(pl.col('I_rate') >= 0.05).select(['pathogen', 'antibiotic']).iter_rows()}
     rows = []
-    for row in df.iter_rows(named=True):
+    for row in tqdm(df.iter_rows(named=True), total=df.height, desc='Filtering I-rate pairs'):
         if row['sir'] == 'I' and (row['pathogen'], row['antibiotic']) not in valid_i_pairs:
             continue
         rows.append(row)
@@ -132,19 +137,31 @@ def filter_ab_sp_combinations(df):
 
 
 def main():
+    print(f'Reading Rdata files from {DATA_DIR}...')
     svebar = read_rdata(DATA_DIR, RDATA_FILES)
+    print(f'  -> {svebar.height} rows loaded')
 
-    taxonomy = set(pl.read_csv(TAXONOMY_FILE, separator='\t', use_columns=['genus']).get_column('genus').to_list())
+    taxonomy = set(pl.read_csv(TAXONOMY_FILE, separator='\t', columns=['genus']).get_column('genus').to_list())
 
     antibiotic_map = load_lookup_table(INDEX_DIR / 'ab_abbrev.tsv')
     species_map = load_lookup_table(INDEX_DIR / 'species_abbrev.tsv')
     sample_map = load_lookup_table(INDEX_DIR / 'sample_categ.tsv')
 
+    print('Prefiltering dataset...')
     svebar = prefilter_dataset(svebar, taxonomy)
-    svebar = format_dataset(svebar, antibiotic_map, species_map, sample_map)
-    svebar = filter_ab_sp_combinations(svebar)
+    print(f'  -> {svebar.height} rows remaining')
 
+    print('Formatting dataset...')
+    svebar = format_dataset(svebar, antibiotic_map, species_map, sample_map)
+    print(f'  -> {svebar.height} rows remaining')
+
+    print('Filtering antibiotic/species combinations...')
+    svebar = filter_ab_sp_combinations(svebar)
+    print(f'  -> {svebar.height} rows remaining')
+
+    print(f'Writing output to {OUTPUT_FILE}...')
     svebar.write_csv(OUTPUT_FILE, separator='\t')
+    print('Done.')
 
 if __name__ == '__main__':
     main()
