@@ -396,7 +396,7 @@ def main():
     cal_results_df = predict_ast_results(df_cal, config, amr_prediction_model, n_epochs, device, vocab, pad_id, thresholds=None)
     thresholds = compute_classification_thresholds(cal_results_df, config)
 
-    with open(config['model']['thresholds'], 'wb') as f:
+    with open(os.path.join(arguments.folder, config['model']['thresholds']), 'wb') as f:
             pkl.dump(thresholds, f)
 
 

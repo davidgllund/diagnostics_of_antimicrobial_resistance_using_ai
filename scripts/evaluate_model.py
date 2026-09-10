@@ -232,7 +232,7 @@ def main():
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     amr_prediction_model.to(device)
 
-    thresholds_path = config['model']['thresholds']
+    thresholds_path = os.path.join(arguments.folder, config['model']['thresholds'])
     if os.path.exists(thresholds_path):
         try:
             with open(thresholds_path, 'rb') as f:
