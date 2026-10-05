@@ -121,23 +121,22 @@ def separate_duplicate_class(items, classes):
     return extracted, remaining
 
 
-def expand_samples_train(dataset, isolates_per_batch, n_metadata, seed, max_predictor_antibiotics=6, samples_per_k=1):
+def expand_samples(dataset, n_metadata, seed, max_predictor_antibiotics=6, train=True):
     if seed is None:
         seed = random.randint(1, 10000)
 
     local_rng = random.Random(seed)
 
-    sampled = dataset.sample(n=isolates_per_batch, seed=seed)
-
     all_predictors = []
     all_responses = []
 
-    for isolate in sampled['sentence']:
-        phenotypes = [x.split('_')[1] for x in isolate[7:]]
-        resistance_rate = sum([x == "R" for x in phenotypes]) / len(phenotypes)
+    for isolate in dataset['sentence']:
+        if train:
+            phenotypes = [x.split('_')[1] for x in isolate[7:]]
+            susceptible_rate = sum([x == "S" for x in phenotypes]) / len(phenotypes)
 
-        if resistance_rate == 0 and local_rng.random() >= 0.75:
-            continue
+            if susceptible_rate == 1 and local_rng.random() <= 0.75:
+                continue
 
         metadata = isolate[:n_metadata]
         antibiotics = isolate[n_metadata:]
@@ -146,35 +145,32 @@ def expand_samples_train(dataset, isolates_per_batch, n_metadata, seed, max_pred
         max_k = min(max_predictor_antibiotics, n_abx)
 
         for k in range(max_k + 1):
-            for _ in range(samples_per_k):
-                # ensure antibiotics is a sequence for random.sample
-                if not isinstance(antibiotics, (list, tuple)):
-                    antibiotics = list(antibiotics)
-                selected_antibiotics = local_rng.sample(antibiotics, k)
-                predictor_set = set(selected_antibiotics)
-                response = [abx for abx in antibiotics if abx not in predictor_set]
+            # ensure antibiotics is a sequence for random.sample
+            if not isinstance(antibiotics, (list, tuple)):
+                antibiotics = list(antibiotics)
+            selected_antibiotics = local_rng.sample(antibiotics, k)
+            predictor_set = set(selected_antibiotics)
+            response = [abx for abx in antibiotics if abx not in predictor_set]
 
-                predictors = ['<cls>', *metadata, *selected_antibiotics]
+            predictors = ['<cls>', *metadata, *selected_antibiotics]
 
-                all_predictors.append(predictors)
-                all_responses.append(response)
+            all_predictors.append(predictors)
+            all_responses.append(response)
 
     return all_predictors, all_responses
 
 
-def expand_samples_eval(dataset, config, isolates_per_batch, n_metadata, seed, max_predictor_antibiotics=6):
+def expand_samples_eval(dataset, config, n_metadata, seed, max_predictor_antibiotics=6):
     if seed is None:
         seed = random.randint(1, 10000)
 
     local_rng = random.Random(seed)
     local_np = np.random.default_rng(seed)
 
-    sampled = dataset.sample(n=isolates_per_batch, seed=seed)
-
     all_predictors = []
     all_responses = []
 
-    for isolate in sampled['sentence']:
+    for isolate in dataset['sentence']:
         metadata = isolate[:n_metadata]
         antibiotics = isolate[n_metadata:]
         
