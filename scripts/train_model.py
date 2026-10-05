@@ -13,7 +13,7 @@ import yaml
 from sys import argv
 from transformers import get_cosine_schedule_with_warmup
 from sklearn.metrics import roc_curve
-from dire.aux import ABTextDataset, expand_samples_train, expand_samples_eval, get_balanced_indices, to_device, append_df_to_tsv, update_ema, print_progress
+from dire.aux import ABTextDataset, expand_samples, to_device, append_df_to_tsv, update_ema, print_progress
 from dire.model_utils import create_model, load_previous_training_state, start_optimizer_loss, save_model
 from dire.evaluate_model import predict_ast_results
 
@@ -56,20 +56,20 @@ def _compute_loss(logits_list, y_pos, y_resp, criterion, train, config, antibiot
     ab_losses = []
     n_total = 0
 
-    all_sr_probs   = []
-    all_class_ids  = []
+    all_sr_probs = []
+    all_class_ids = []
 
-    grp_reg_sum   = torch.tensor(0.0, device=device)
-    n_grp_terms   = 0
+    grp_reg_sum = torch.tensor(0.0, device=device)
+    n_grp_terms = 0
 
     lambda_class = config['train'].get('lambda_class_reg', 0.0)
-    lambda_grp   = config['train'].get('lambda_grp_reg', 0.0)
+    lambda_grp = config['train'].get('lambda_grp_reg', 0.0)
 
-    ab_to_class_name = config['model'].get('ab_class', {})
-    unique_classes   = sorted(set(ab_to_class_name.values()))
+    ab_to_class_name = config['vocab'].get('ab_class', {})
+    unique_classes = sorted(set(ab_to_class_name.values()))
     class_name_to_id = {name: i for i, name in enumerate(unique_classes)}
 
-    sp_grps        = config['vocab'].get('sp_grp', {})
+    sp_grps = config['vocab'].get('sp_grp', {})
     species_to_idx = {sp: i for i, (grp, sp_list) in enumerate(sp_grps.items()) for sp in sp_list}
 
     species_arr = np.array(species)
@@ -79,7 +79,7 @@ def _compute_loss(logits_list, y_pos, y_resp, criterion, train, config, antibiot
         if not mask.any():
             continue
 
-        logits  = logits_ab[mask]
+        logits = logits_ab[mask]
         targets = y_resp[mask, ab_idx]
 
         per_sample_loss = criterion[ab_name](logits, targets)
@@ -172,8 +172,6 @@ def forward_epoch(df, config, amr_prediction_model, criterion, optimizer, schedu
 
     max_n_tokens = model_cfg['max_n_tokens']
     batch_size = data_cfg['batch_size']
-    obs_per_epoch = data_cfg['obs_per_epoch']
-    isolates_per_batch = data_cfg['isolates_to_sample_per_batch']
     n_metadata = config['train']['n_metadata']
     encode_response = model_cfg['encode_response']
 
@@ -183,21 +181,11 @@ def forward_epoch(df, config, amr_prediction_model, criterion, optimizer, schedu
     pin_memory = torch.cuda.is_available()
     persistent_workers = num_workers > 0
      
-    if train: 
-        x, y = expand_samples_train(df, isolates_per_batch, n_metadata, epoch_idx, 6)
-    else:
-        x, y = expand_samples_eval(df, config, isolates_per_batch, n_metadata, epoch_idx, 6)
-
-    idx = get_balanced_indices(x, y, obs_per_epoch)
-
-    x = [x[j] for j in idx]
-    y = [y[j] for j in idx]
+    x, y = expand_samples(df, n_metadata, epoch_idx, 6, train)
 
     dataset = ABTextDataset(x, y, vocab, antibiotics, max_n_tokens, encode_response)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size, shuffle=train, num_workers=num_workers, 
                                              pin_memory=pin_memory, persistent_workers=persistent_workers)
-    
-    n_batches = int(np.ceil(min(len(dataset), obs_per_epoch) / batch_size))
 
     amr_prediction_model.train() if train else amr_prediction_model.eval()
 
@@ -207,7 +195,7 @@ def forward_epoch(df, config, amr_prediction_model, criterion, optimizer, schedu
 
     batch_times = []
 
-    for batch_idx, batch in enumerate(dataloader):
+    for _, batch in enumerate(dataloader):
         start_time = time.time()
         token_ids, year, month, age, species_batch, _, _, _, _, y_resp, y_pos = to_device(batch, device)
         
@@ -250,9 +238,6 @@ def forward_epoch(df, config, amr_prediction_model, criterion, optimizer, schedu
         total_samples += count
 
         batch_times.append(time.time() - start_time)
-
-        if batch_idx + 1 == n_batches:
-            break
 
     avg_loss = total_loss / total_samples
     avg_acc = total_correct / total_samples
@@ -305,13 +290,16 @@ def main():
     train_perf_path = os.path.join(arguments.folder, 'avg_train_performance.tsv')
     val_perf_path = os.path.join(arguments.folder, 'avg_val_performance.tsv')
 
-    obs_train = config['train']['obs_per_epoch']
-    obs_val = config['test']['obs_per_epoch']
     bs_train = config['train']['batch_size']
     bs_val = config['test']['batch_size']
+    n_metadata = config['train']['n_metadata']
 
-    train_batches_per_epoch = int(np.ceil(obs_train / bs_train))
-    val_batches_per_epoch = int(np.ceil(obs_val / bs_val))
+    x_train_probe, _ = expand_samples(df_train, n_metadata, 0, 6, train=True)
+    x_val_probe, _ = expand_samples(df_val, n_metadata, 0, 6, train=False)
+
+    train_batches_per_epoch = int(np.ceil(len(x_train_probe) / bs_train))
+    val_batches_per_epoch = int(np.ceil(len(x_val_probe) / bs_val))
+    del x_train_probe, x_val_probe
 
     batches_per_epoch = train_batches_per_epoch + val_batches_per_epoch
     total_training_batches = n_epochs * batches_per_epoch
@@ -375,6 +363,14 @@ def main():
         if val_loss < min_val_loss:
             min_val_loss = val_loss
             save_model(os.path.join(arguments.folder, 'amr_prediction_model.torch'), amr_prediction_model)
+            es_count = 0
+        else:
+            es_count += 1
+
+        # Early stopping if validation loss has not improved for ten epochs
+        if es_count == 10:
+            print('Validation loss has not improved for ten epochs. Early stopping triggered.')
+            break
 
         state = {
             'epoch': epoch,

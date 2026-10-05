@@ -9,7 +9,7 @@ import yaml
 
 from sys import argv
 from dire.model_utils import load_previous_training_state, create_model
-from dire.aux import ABTextDataset, expand_samples_eval, get_balanced_indices, to_device
+from dire.aux import ABTextDataset, expand_samples_eval, to_device
 
 N_CONTINUOUS_FEATURES = 3 
 
@@ -23,14 +23,12 @@ def parse_args(argv):
     return arguments
 
 
-def predict_ast_results(df, config, amr_prediction_model, epoch_idx, device, vocab, pad_id, thresholds=None):
+def predict_ast_results(df, config, amr_prediction_model, device, vocab, pad_id, thresholds=None):
     model_cfg = config['model']
     data_cfg = config['test']
 
     max_n_tokens = model_cfg['max_n_tokens']
-    batch_size = data_cfg['batch_size']
-    obs_per_epoch = data_cfg['obs_per_epoch']
-    isolates_per_batch = data_cfg['isolates_to_sample_per_batch']
+    batch_size = data_cfg['batch_size'] 
     n_metadata = config['train']['n_metadata']
     encode_response = model_cfg['encode_response']
 
@@ -40,11 +38,7 @@ def predict_ast_results(df, config, amr_prediction_model, epoch_idx, device, voc
     pin_memory = torch.cuda.is_available()
     persistent_workers = num_workers > 0
 
-    x, y = expand_samples_eval(df, config, isolates_per_batch, n_metadata, epoch_idx, 6)
-    idx = get_balanced_indices(x, y, obs_per_epoch)
-
-    x = [x[j] for j in idx]
-    y = [y[j] for j in idx]
+    x, y = expand_samples_eval(df, config, n_metadata, 0, 6)
 
     dataset = ABTextDataset(x, y, vocab, antibiotics, max_n_tokens, encode_response)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size, shuffle=False, num_workers=num_workers,
@@ -161,7 +155,7 @@ def conformal_prediction(cal_results, eval_results, config):
         (1.0 - pl.col('pR')).alias('nonconf_R'),
     )
 
-    alpha = 1 - 0.95
+    alpha = 1 - 0.99
     q_hats = {}
 
     for (abx, sp), g in cal_results.group_by(['antibiotic', 'species']):
@@ -242,8 +236,8 @@ def main():
             thresholds = None
 
     print('Predicting AST results...')
-    cal_results_df = predict_ast_results(df_cal, config, amr_prediction_model, 100, device, vocab, pad_id, thresholds)
-    eval_results_df = predict_ast_results(df_eval, config, amr_prediction_model, 100, device, vocab, pad_id, thresholds)
+    cal_results_df = predict_ast_results(df_cal, config, amr_prediction_model, device, vocab, pad_id, thresholds)
+    eval_results_df = predict_ast_results(df_eval, config, amr_prediction_model, device, vocab, pad_id, thresholds)
 
     print('Performing conformal prediction...')
     df_eval_cp, q_hats = conformal_prediction(cal_results_df, eval_results_df, config)
