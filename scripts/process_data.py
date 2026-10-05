@@ -86,7 +86,7 @@ def main():
     print('Formatting data')
     sentence = format_data(data)
 
-    fold = np.random.choice(['train', 'validation', 'calibration', 'test'], size=len(sentence), p=[0.4, 0.1, 0.4, 0.1])
+    fold = np.random.choice(['train', 'validation', 'calibration', 'test'], size=len(sentence), p=[0.6, 0.1, 0.2, 0.1])
     n_ab = [count_antibiotics(x, 7) for x in sentence]
 
     df_formatted = pl.DataFrame({'sentence': sentence, 'n_ab': n_ab, 'fold': fold})

@@ -98,11 +98,6 @@ def format_dataset(df, antibiotic_map, species_map, sample_map):
 def filter_ab_sp_combinations(df):
     df = df.clone()
 
-    top_sp = (
-        df.select(['lab_id', 'isolate_id', 'pathogen']).unique().group_by('pathogen').len().filter(pl.col('len') >= 10000)
-    )
-    df = df.join(top_sp.select('pathogen'), on='pathogen', how='inner')
-
     ab_keep_df = (
         df.with_columns(
             (pl.col('sir') == 'S').cast(pl.Int8).alias('isS'),
@@ -120,6 +115,11 @@ def filter_ab_sp_combinations(df):
     )
 
     df = df.join(ab_keep_df.select(['pathogen', 'antibiotic']), on=['pathogen', 'antibiotic'], how='inner')
+
+    top_sp = (
+        df.select(['lab_id', 'isolate_id', 'pathogen']).unique().group_by('pathogen').len().filter(pl.col('len') >= 10000)
+    )
+    df = df.join(top_sp.select('pathogen'), on='pathogen', how='inner')
 
     valid_i_pairs = {(row[0], row[1]) for row in ab_keep_df.filter(pl.col('I_rate') >= 0.05).select(['pathogen', 'antibiotic']).iter_rows()}
     rows = []
