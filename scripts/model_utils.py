@@ -113,7 +113,7 @@ def start_optimizer_loss(config, amr_prediction_model, rank=0):
     for ab in antibiotics:
         criterion[ab] = nn.CrossEntropyLoss(reduction='none', label_smoothing=0.1)
 
-    optimizer = optim.Adam(params=amr_prediction_model.parameters(), lr=train_cfg['learning_rate'])
+    optimizer = optim.AdamW(params=amr_prediction_model.parameters(), lr=train_cfg['learning_rate'], weight_decay=0.01)
     
     return criterion, optimizer
 
