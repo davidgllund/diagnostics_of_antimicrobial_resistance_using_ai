@@ -24,8 +24,6 @@ dire = "dire.cli:main"
 dire-train = "dire.cli:train"
 dire-evaluate = "dire.cli:evaluate"
 dire-process-data = "dire.cli:process_data"
-dire-process-eval-data = "dire.cli:process_eval_data"
-dire-specific-predictions = "dire.cli:specific_predictions"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
