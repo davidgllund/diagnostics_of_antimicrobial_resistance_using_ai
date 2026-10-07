@@ -13,7 +13,7 @@ import yaml
 from sys import argv
 from transformers import get_cosine_schedule_with_warmup
 from sklearn.metrics import roc_curve
-from dire.aux import ABTextDataset, expand_samples, to_device, append_df_to_tsv, update_ema, print_progress
+from dire.aux_utils import ABTextDataset, expand_samples, to_device, append_df_to_tsv, update_ema, print_progress
 from dire.model_utils import create_model, load_previous_training_state, start_optimizer_loss, save_model
 from dire.evaluate_model import predict_ast_results
 

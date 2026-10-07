@@ -9,7 +9,7 @@ import yaml
 
 from sys import argv
 from dire.model_utils import load_previous_training_state, create_model
-from dire.aux import ABTextDataset, expand_samples_eval, to_device
+from dire.aux_utils import ABTextDataset, expand_samples_eval, to_device
 
 N_CONTINUOUS_FEATURES = 3 
 

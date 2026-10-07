@@ -7,7 +7,7 @@ import torch
 from collections import defaultdict
 from tqdm import tqdm
 from sys import argv
-from dire.aux import Vocab
+from dire.aux_utils import Vocab
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(description='Format input data and generate vocabulary file.')
