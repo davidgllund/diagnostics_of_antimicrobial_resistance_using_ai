@@ -133,7 +133,6 @@ class AMRPredictionModel(nn.Module):
         logits_list = []
 
         for classifier in self.classifiers:
-
             cls_input = torch.cat([cls_representation, sampling_time_data], dim=1)
             logits = classifier(cls_input)
 
