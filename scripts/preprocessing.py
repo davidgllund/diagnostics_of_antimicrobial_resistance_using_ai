@@ -6,7 +6,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 DATA_DIR = Path('/home/dlund/dire/data/svebar')
-INDEX_DIR = Path('/home/dlund/dire/index_files')
+INDEX_DIR = Path('/home/dlund/dire/auxiliary_files')
 TAXONOMY_FILE = Path('/storage_i/dlund/ncbi_taxonomy/bacterial_taxonomy_table.tsv')
 
 RDATA_FILES = [
@@ -143,7 +143,7 @@ def main():
 
     taxonomy = set(pl.read_csv(TAXONOMY_FILE, separator='\t', columns=['genus']).get_column('genus').to_list())
 
-    antibiotic_map = load_lookup_table(INDEX_DIR / 'ab_abbrev.tsv')
+    antibiotic_map = load_lookup_table(INDEX_DIR / 'antibiotic_abbrev.tsv')
     species_map = load_lookup_table(INDEX_DIR / 'species_abbrev.tsv')
     sample_map = load_lookup_table(INDEX_DIR / 'sample_categ.tsv')
 
