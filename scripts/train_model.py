@@ -12,10 +12,8 @@ import yaml
 
 from sys import argv
 from transformers import get_cosine_schedule_with_warmup
-from sklearn.metrics import roc_curve
 from dire.aux_utils import ABTextDataset, expand_samples, to_device, append_df_to_tsv, update_ema, print_progress
 from dire.model_utils import create_model, load_previous_training_state, start_optimizer_loss, save_model
-from dire.evaluate_model import predict_ast_results
 
 N_CONTINUOUS_FEATURES = 3 
 
@@ -26,21 +24,17 @@ def parse_args(argv):
     return parser.parse_args(argv)
 
 
-def _apply_regularization(probs, class_ids, lambda_reg, device):
-    if probs.size(0) <= 1:
+def _antibiotic_class_regularization(prob_matrix, mask_matrix, lambda_reg, device):
+    counts = mask_matrix.sum(dim=1)
+    valid_rows = counts >= 2
+    if not valid_rows.any():
         return torch.tensor(0.0, device=device)
 
-    n_classes = class_ids.max() + 1
-    sum_probs = torch.zeros(n_classes, probs.size(1), device=device)
-    sum_probs.index_add_(0, class_ids, probs)
+    row_mean = (prob_matrix * mask_matrix).sum(dim=1) / counts.clamp(min=1)
+    deviations = (prob_matrix - row_mean.unsqueeze(1)) ** 2 * mask_matrix
+    per_row_loss = deviations.sum(dim=1) / counts.clamp(min=1)
 
-    counts = torch.bincount(class_ids, minlength=n_classes).clamp(min=1).unsqueeze(1)
-    class_means = sum_probs / counts
-
-    means_per_sample = class_means[class_ids]
-    reg_loss = torch.mean((probs - means_per_sample) ** 2)
-
-    return lambda_reg * reg_loss
+    return lambda_reg * per_row_loss[valid_rows].mean()
 
 
 def _extract_sr_probs(logits):
@@ -56,23 +50,13 @@ def _compute_loss(logits_list, y_pos, y_resp, criterion, train, config, antibiot
     ab_losses = []
     n_total = 0
 
-    all_sr_probs = []
-    all_class_ids = []
-
-    grp_reg_sum = torch.tensor(0.0, device=device)
-    n_grp_terms = 0
+    class_members = {} 
 
     lambda_class = config['train'].get('lambda_class_reg', 0.0)
-    lambda_grp = config['train'].get('lambda_grp_reg', 0.0)
 
     ab_to_class_name = config['vocab'].get('ab_class', {})
     unique_classes = sorted(set(ab_to_class_name.values()))
     class_name_to_id = {name: i for i, name in enumerate(unique_classes)}
-
-    sp_grps = config['vocab'].get('sp_grp', {})
-    species_to_idx = {sp: i for i, (grp, sp_list) in enumerate(sp_grps.items()) for sp in sp_list}
-
-    species_arr = np.array(species)
 
     for ab_idx, (ab_name, logits_ab) in enumerate(zip(antibiotics, logits_list)):
         mask = y_pos[:, ab_idx] == 1
@@ -89,26 +73,12 @@ def _compute_loss(logits_list, y_pos, y_resp, criterion, train, config, antibiot
         if not train:
             continue
 
-        sr_probs = _extract_sr_probs(logits)
-
-        if lambda_grp > 0:
-            grp_ids = torch.tensor(
-                [species_to_idx.get(s, -1) for s in species_arr[mask.cpu().numpy()]],
-                device=device, dtype=torch.long
-            )
-            valid = grp_ids != -1
-            if valid.any():
-                grp_reg_sum += _apply_regularization(sr_probs[valid], grp_ids[valid], lambda_grp, device)
-                n_grp_terms += 1
-
         if lambda_class > 0:
             class_name = ab_to_class_name.get(ab_name)
             if class_name:
                 class_id = class_name_to_id[class_name]
-                all_sr_probs.append(sr_probs)
-                all_class_ids.append(
-                    torch.full((logits.size(0),), class_id, device=device, dtype=torch.long)
-                )
+                r_prob_full = _extract_sr_probs(logits_ab)[:, 1]
+                class_members.setdefault(class_id, []).append((r_prob_full, mask.float()))
 
     if not ab_losses:
         return None, None
@@ -118,52 +88,42 @@ def _compute_loss(logits_list, y_pos, y_resp, criterion, train, config, antibiot
     if not train:
         return ce_loss, ce_loss.item()
 
-    reg_loss_grp = grp_reg_sum / max(n_grp_terms, 1) if n_grp_terms > 0 else torch.tensor(0.0, device=device)
-
     reg_loss_class = torch.tensor(0.0, device=device)
-    if lambda_class > 0 and all_sr_probs:
-        pooled_probs    = torch.cat(all_sr_probs, dim=0)
-        pooled_class_ids = torch.cat(all_class_ids, dim=0)
-        reg_loss_class  = _apply_regularization(pooled_probs, pooled_class_ids, lambda_class, device)
+    if lambda_class > 0 and class_members:
+        class_losses = []
+        for members in class_members.values():
+            if len(members) < 2:
+                continue
+            prob_matrix = torch.stack([m[0] for m in members], dim=1)
+            mask_matrix = torch.stack([m[1] for m in members], dim=1)
+            class_losses.append(_antibiotic_class_regularization(prob_matrix, mask_matrix, lambda_class, device))
+        if class_losses:
+            reg_loss_class = torch.stack(class_losses).mean()
 
-    total_loss = ce_loss + reg_loss_class + reg_loss_grp
+    total_loss = ce_loss + reg_loss_class
     return total_loss, ce_loss.item()
 
-    
-def compute_classification_thresholds(df, config):
-    outputs_per_antibiotic = config['model']['n_outputs_per_antibiotic']
-    thresholds = {}
 
-    # iterate unique (antibiotic, species, n_ast_results) combinations
-    groups = df.select(['antibiotic', 'species', 'n_ast_results']).unique()
-    for ab, sp, n_ast in groups.iter_rows():
-        sub = df.filter(
-            (pl.col('antibiotic') == ab) &
-            (pl.col('species') == sp) &
-            (pl.col('n_ast_results') == n_ast)
-        )
+def _recover_es_count(val_perf_path, min_delta):
+    """Replay the early-stopping patience logic over the logged validation losses so
+    that resuming a run doesn't lose track of how many non-improving epochs preceded it
+    (and so `es_count` is always defined, even on the first epoch after a resume)."""
+    if not os.path.exists(val_perf_path):
+        return 0
 
-        if sub.height == 0:
-            continue
+    df_val_log = pl.read_csv(val_perf_path, separator='\t')
+    if df_val_log.is_empty():
+        return 0
 
-        n_outputs = outputs_per_antibiotic[ab]
-        y_score = np.array(sub['pR'].to_list(), dtype=float)
-        truths = sub['true'].to_list()
-
-        if n_outputs == 2:
-            y_true = np.array([0 if t == 'S' else 1 for t in truths], dtype=int)
+    best = float('inf')
+    es_count = 0
+    for loss in df_val_log.sort('epoch')['avg_loss'].to_list():
+        if loss < best - min_delta:
+            best = loss
+            es_count = 0
         else:
-            y_true = np.array([0 if t in ('S', 'I') else 1 for t in truths], dtype=int)
-
-        if y_true.size == 0:
-            continue
-
-        fpr, tpr, thr = roc_curve(y_true, y_score)
-        dist = np.sqrt((1 - tpr)**2 + fpr**2)
-        best_point = thr[np.argmin(dist)]
-        thresholds[(ab, sp, n_ast)] = best_point
-
-    return thresholds
+            es_count += 1
+    return es_count
 
 
 def forward_epoch(df, config, amr_prediction_model, criterion, optimizer, scheduler, epoch_idx, device, vocab, pad_id, train=True):
@@ -180,8 +140,11 @@ def forward_epoch(df, config, amr_prediction_model, criterion, optimizer, schedu
     num_workers = min(4, os.cpu_count() or 1)
     pin_memory = torch.cuda.is_available()
     persistent_workers = num_workers > 0
-     
-    x, y = expand_samples(df, n_metadata, epoch_idx, 6, train)
+
+    # Validation always re-samples the same context/target split (fixed seed) so that
+    # val_loss changes reflect model improvement, not a different random split each epoch.
+    sample_seed = epoch_idx if train else 0
+    x, y = expand_samples(df, n_metadata, sample_seed, 6, train)
 
     dataset = ABTextDataset(x, y, vocab, antibiotics, max_n_tokens, encode_response)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size, shuffle=train, num_workers=num_workers, 
@@ -265,7 +228,6 @@ def main():
     df = df.with_columns(pl.col('sentence').str.split(' '))
     df_train = df.filter(pl.col('fold').is_in(['train']))
     df_val = df.filter(pl.col('fold').is_in(['validation']))
-    df_cal = df.filter(pl.col('fold').is_in(['calibration']))
 
     rank = 0
     print('Initializing model...')
@@ -289,6 +251,10 @@ def main():
 
     train_perf_path = os.path.join(arguments.folder, 'avg_train_performance.tsv')
     val_perf_path = os.path.join(arguments.folder, 'avg_val_performance.tsv')
+
+    early_stopping_patience = config['train'].get('early_stopping_patience', 10)
+    early_stopping_min_delta = config['train'].get('early_stopping_min_delta', 0.0)
+    es_count = _recover_es_count(val_perf_path, early_stopping_min_delta)
 
     bs_train = config['train']['batch_size']
     bs_val = config['test']['batch_size']
@@ -360,16 +326,16 @@ def main():
         append_df_to_tsv(val_perf_path, avg_val_results)
         print()
 
-        if val_loss < min_val_loss:
+        if val_loss < min_val_loss - early_stopping_min_delta:
             min_val_loss = val_loss
             save_model(os.path.join(arguments.folder, 'amr_prediction_model.torch'), amr_prediction_model)
             es_count = 0
         else:
             es_count += 1
 
-        # Early stopping if validation loss has not improved for ten epochs
-        if es_count == 10:
-            print('Validation loss has not improved for ten epochs. Early stopping triggered.')
+        if es_count >= early_stopping_patience:
+            print(f'Validation loss has not improved by more than {early_stopping_min_delta} for '
+                  f'{early_stopping_patience} epochs. Early stopping triggered.')
             break
 
         state = {
@@ -387,13 +353,6 @@ def main():
             print(f'Warning: Failed to save training state: {e}')
 
     print('Training complete!')
-
-    print('Computing classification thresholds...')
-    cal_results_df = predict_ast_results(df_cal, config, amr_prediction_model, n_epochs, device, vocab, pad_id, thresholds=None)
-    thresholds = compute_classification_thresholds(cal_results_df, config)
-
-    with open(os.path.join(arguments.folder, config['model']['thresholds']), 'wb') as f:
-            pkl.dump(thresholds, f)
 
 
 if __name__ == '__main__':
