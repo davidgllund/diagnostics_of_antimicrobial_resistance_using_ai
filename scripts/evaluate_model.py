@@ -8,6 +8,7 @@ import torch
 import yaml
 
 from sys import argv
+from sklearn.metrics import roc_curve
 from dire.model_utils import load_previous_training_state, create_model
 from dire.aux_utils import ABTextDataset, expand_samples_eval, to_device
 
@@ -21,6 +22,42 @@ def parse_args(argv):
     arguments = parser.parse_args(argv)
 
     return arguments
+
+
+def compute_classification_thresholds(df, config):
+    outputs_per_antibiotic = config['model']['n_outputs_per_antibiotic']
+    thresholds = {}
+
+    # iterate unique (antibiotic, species, n_ast_results) combinations
+    groups = df.select(['antibiotic', 'species', 'n_ast_results']).unique()
+    for ab, sp, n_ast in groups.iter_rows():
+        sub = df.filter(
+            (pl.col('antibiotic') == ab) &
+            (pl.col('species') == sp) &
+            (pl.col('n_ast_results') == n_ast)
+        )
+
+        if sub.height == 0:
+            continue
+
+        n_outputs = outputs_per_antibiotic[ab]
+        y_score = np.array(sub['pR'].to_list(), dtype=float)
+        truths = sub['true'].to_list()
+
+        if n_outputs == 2:
+            y_true = np.array([0 if t == 'S' else 1 for t in truths], dtype=int)
+        else:
+            y_true = np.array([0 if t in ('S', 'I') else 1 for t in truths], dtype=int)
+
+        if y_true.size == 0:
+            continue
+
+        fpr, tpr, thr = roc_curve(y_true, y_score)
+        dist = np.sqrt((1 - tpr)**2 + fpr**2)
+        best_point = thr[np.argmin(dist)]
+        thresholds[(ab, sp, n_ast)] = best_point
+
+    return thresholds
 
 
 def predict_ast_results(df, config, amr_prediction_model, device, vocab, pad_id, thresholds=None):
@@ -144,7 +181,6 @@ def predict_ast_results(df, config, amr_prediction_model, device, vocab, pad_id,
 
 
 def conformal_prediction(cal_results, eval_results, config):
-    min_group_size = 100
     cal_results = cal_results.clone()
     results_out = eval_results.clone()
     n_outputs_per_antibiotic = config['model']['n_outputs_per_antibiotic']
@@ -155,7 +191,7 @@ def conformal_prediction(cal_results, eval_results, config):
         (1.0 - pl.col('pR')).alias('nonconf_R'),
     )
 
-    alpha = 1 - 0.99
+    alpha = 1 - 0.95
     q_hats = {}
 
     for (abx, sp), g in cal_results.group_by(['antibiotic', 'species']):
@@ -167,12 +203,14 @@ def conformal_prediction(cal_results, eval_results, config):
         for lbl in labels:
             vals = g.filter(pl.col('true') == lbl).get_column(f'nonconf_{lbl}').sort().to_list()
             n = len(vals)
-            if n >= min_group_size:
-                k = int(np.ceil((n + 1) * (1 - alpha)))
-                k = min(max(k, 1), n)
-                q_hats[(abx, sp, lbl)] = float(vals[k - 1])
-            else:
+
+            if n == 0:
                 q_hats[(abx, sp, lbl)] = None
+                continue
+
+            k = int(np.ceil((n + 1) * (1 - alpha)))
+            k = min(max(k, 1), n)
+            q_hats[(abx, sp, lbl)] = float(vals[k - 1])
 
     conformal_sets = []
     q_used = []
@@ -234,6 +272,13 @@ def main():
         except Exception as e:
             print(f'Warning: Failed to load thresholds from {thresholds_path}: {e}')
             thresholds = None
+    else:
+        print('Computing classification thresholds...')
+        cal_results_df = predict_ast_results(df_cal, config, amr_prediction_model, device, vocab, pad_id, thresholds=None)
+        thresholds = compute_classification_thresholds(cal_results_df, config)
+
+        with open(thresholds_path, 'wb') as f:
+                pkl.dump(thresholds, f)
 
     print('Predicting AST results...')
     cal_results_df = predict_ast_results(df_cal, config, amr_prediction_model, device, vocab, pad_id, thresholds)
