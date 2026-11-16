@@ -33,6 +33,12 @@ def load_lookup_table(path):
     return mapping
 
 
+def load_antibiotic_class_map(path):
+    df = pl.read_csv(path, separator='\t', has_header=False)
+    mapping = dict(zip(df['column_2'].to_list(), df['column_3'].to_list()))
+    return mapping
+
+
 def prefilter_dataset(df, taxonomy):
     df = df.filter(
         (pl.col('smittamne_namn') != 'NEGATIV') &
@@ -95,7 +101,7 @@ def format_dataset(df, antibiotic_map, species_map, sample_map):
     ])
 
 
-def filter_ab_sp_combinations(df):
+def filter_ab_sp_combinations(df, antibiotic_class_map):
     df = df.clone()
 
     ab_keep_df = (
@@ -106,12 +112,15 @@ def filter_ab_sp_combinations(df):
         )
         .group_by(['pathogen', 'antibiotic'])
         .agg(
-            pl.col('isI').mean().alias('I_rate'),
             pl.col('isS').mean().alias('S_rate'),
+            pl.col('isI').mean().alias('I_rate'),
             pl.col('isR').mean().alias('R_rate'),
+            pl.col('isS').sum().alias('S_count'),
+            pl.col('isI').sum().alias('I_count'),
+            pl.col('isR').sum().alias('R_count'),
             pl.len().alias('n')
         )
-        .filter((pl.col('S_rate') >= 0.05) & (pl.col('R_rate') >= 0.05) & (pl.col('n') >= 1000))
+        .filter((pl.col('S_rate') >= 0.05) & (pl.col('S_count') >= 500) & (pl.col('R_rate') >= 0.05) & (pl.col('R_count') >= 500))
     )
 
     df = df.join(ab_keep_df.select(['pathogen', 'antibiotic']), on=['pathogen', 'antibiotic'], how='inner')
@@ -121,7 +130,7 @@ def filter_ab_sp_combinations(df):
     )
     df = df.join(top_sp.select('pathogen'), on='pathogen', how='inner')
 
-    valid_i_pairs = {(row[0], row[1]) for row in ab_keep_df.filter(pl.col('I_rate') >= 0.05).select(['pathogen', 'antibiotic']).iter_rows()}
+    valid_i_pairs = {(row[0], row[1]) for row in ab_keep_df.filter((pl.col('I_rate') >= 0.05) & (pl.col('I_count') >= 500)).select(['pathogen', 'antibiotic']).iter_rows()}
     rows = []
     for row in tqdm(df.iter_rows(named=True), total=df.height, desc='Filtering I-rate pairs'):
         if row['sir'] == 'I' and (row['pathogen'], row['antibiotic']) not in valid_i_pairs:
@@ -130,7 +139,14 @@ def filter_ab_sp_combinations(df):
     df = pl.DataFrame(rows)
 
     final_sp = (
-        df.select(['pathogen', 'antibiotic']).unique().group_by('pathogen').len().filter(pl.col('len') >= 5)
+        df.with_columns(
+            pl.col('antibiotic').map_elements(lambda x: antibiotic_class_map.get(x, x), return_dtype=pl.String).alias('antibiotic_class')
+        )
+        .select(['pathogen', 'antibiotic_class'])
+        .unique()
+        .group_by('pathogen')
+        .len()
+        .filter(pl.col('len') >= 3)
     )
     df = df.join(final_sp.select('pathogen'), on='pathogen', how='inner')
     return df
@@ -146,6 +162,7 @@ def main():
     antibiotic_map = load_lookup_table(INDEX_DIR / 'antibiotic_abbrev.tsv')
     species_map = load_lookup_table(INDEX_DIR / 'species_abbrev.tsv')
     sample_map = load_lookup_table(INDEX_DIR / 'sample_categ.tsv')
+    antibiotic_class_map = load_antibiotic_class_map(INDEX_DIR / 'antibiotic_abbrev.tsv')
 
     print('Prefiltering dataset...')
     svebar = prefilter_dataset(svebar, taxonomy)
@@ -156,7 +173,7 @@ def main():
     print(f'  -> {svebar.height} rows remaining')
 
     print('Filtering antibiotic/species combinations...')
-    svebar = filter_ab_sp_combinations(svebar)
+    svebar = filter_ab_sp_combinations(svebar, antibiotic_class_map)
     print(f'  -> {svebar.height} rows remaining')
 
     print(f'Writing output to {OUTPUT_FILE}...')
